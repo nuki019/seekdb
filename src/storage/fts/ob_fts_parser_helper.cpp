@@ -311,6 +311,10 @@ int ObFTParseHelper::segment(
 
 ObFTParseHelper::ObFTParseHelper()
     : allocator_(nullptr),
+    metadata_alloc_(lib::ObMemAttr("FTMetaAlloc")),
+    cached_iter_(nullptr),
+    cached_cs_(nullptr),
+    word_map_(),
     parser_desc_(nullptr),
     parser_name_(),
     add_word_flag_(),
@@ -352,10 +356,113 @@ int ObFTParseHelper::init(
 
 void ObFTParseHelper::reset()
 {
+  if (OB_NOT_NULL(cached_iter_) && OB_NOT_NULL(parser_desc_)) {
+    ObFTParserParam param;
+    param.allocator_ = &metadata_alloc_;
+    parser_desc_->free_token_iter(&param, cached_iter_);
+    cached_iter_ = nullptr;
+  }
+  cached_cs_ = nullptr;
+  metadata_alloc_.reset();
+  if (word_map_.created()) {
+    word_map_.destroy();
+  }
   parser_desc_ = nullptr;
   allocator_ = nullptr;
   add_word_flag_.clear();
   is_inited_ = false;
+}
+
+int ObFTParseHelper::get_word_map(const int64_t bucket_cnt, ObFTWordMap *&word_map) const
+{
+  int ret = OB_SUCCESS;
+  static constexpr int64_t MIN_REUSABLE_WORD_BUCKETS = 67;
+  static constexpr int64_t MAX_REUSABLE_WORD_BUCKETS = 127;
+  if (!word_map_.created()) {
+    const int64_t bkt = MAX(MIN(bucket_cnt, MAX_REUSABLE_WORD_BUCKETS), MIN_REUSABLE_WORD_BUCKETS);
+    if (OB_FAIL(word_map_.create(bkt, common::ObMemAttr("FTWordMap")))) {
+    }
+  } else {
+    word_map_.reuse();
+  }
+  if (OB_SUCC(ret)) {
+    word_map = &word_map_;
+  }
+  return ret;
+}
+
+int ObFTParseHelper::segment_with_reuse(
+    const ObCharsetInfo *cs,
+    const char *ft,
+    const int64_t ft_len,
+    ObAddWord &add_word) const
+{
+  int ret = OB_SUCCESS;
+  const int64_t parser_version = parser_name_.get_parser_version();
+  if (OB_UNLIKELY(parser_version < 0 || nullptr == parser_desc_ || nullptr == cs || nullptr == ft || 0 >= ft_len)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    ObFTParserParam param;
+    param.allocator_ = &metadata_alloc_;
+    param.cs_ = cs;
+    param.fulltext_ = ft;
+    param.ft_length_ = ft_len;
+    param.parser_version_ = parser_version;
+    param.ngram_token_size_ = parser_property_.ngram_token_size_;
+    param.ik_param_.mode_
+        = (parser_property_.ik_mode_smart_ ? ObFTIKParam::Mode::SMART : ObFTIKParam::Mode::MAX_WORD);
+    param.min_ngram_size_ = parser_property_.min_ngram_token_size_;
+    param.max_ngram_size_ = parser_property_.max_ngram_token_size_;
+
+    if (OB_NOT_NULL(cached_iter_) && cached_cs_ != cs) {
+      parser_desc_->free_token_iter(&param, cached_iter_);
+      cached_iter_ = nullptr;
+      cached_cs_ = nullptr;
+      metadata_alloc_.reuse();
+    }
+
+    if (OB_ISNULL(cached_iter_)) {
+      if (OB_FAIL(parser_desc_->segment(&param, cached_iter_))) {
+      } else {
+        cached_cs_ = cs;
+      }
+    } else if (OB_FAIL(cached_iter_->reuse_parser(param))) {
+      parser_desc_->free_token_iter(&param, cached_iter_);
+      cached_iter_ = nullptr;
+      cached_cs_ = nullptr;
+      metadata_alloc_.reuse();
+      if (OB_FAIL(parser_desc_->segment(&param, cached_iter_))) {
+      } else {
+        cached_cs_ = cs;
+      }
+    }
+
+    if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(cached_iter_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      const char *word = nullptr;
+      int64_t word_len = 0;
+      int64_t char_cnt = 0;
+      int64_t word_freq = 0;
+      while (OB_SUCC(ret)) {
+        if (OB_FAIL(cached_iter_->get_next_token(word, word_len, char_cnt, word_freq))) {
+          if (OB_ITER_END != ret) {
+          }
+        } else if (OB_FAIL(add_word.process_word(word, word_len, char_cnt, word_freq))) {
+        }
+      }
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+      } else if (OB_FAIL(ret)) {
+        parser_desc_->free_token_iter(&param, cached_iter_);
+        cached_iter_ = nullptr;
+        cached_cs_ = nullptr;
+        metadata_alloc_.reuse();
+      }
+    }
+  }
+  return ret;
 }
 
 int ObFTParseHelper::segment(
@@ -379,14 +486,10 @@ int ObFTParseHelper::segment(
   } else {
     words.reuse();
     ObAddWord add_word(parser_property_, meta, add_word_flag_, *allocator_, words);
-    if (OB_FAIL(segment(
-                    parser_property_,
-                    parser_name_.get_parser_version(),
-                    parser_desc_,
+    if (OB_FAIL(segment_with_reuse(
                     cs,
                     fulltext,
                     fulltext_len,
-                    *allocator_,
                     add_word))) {
     } else {
       doc_length = add_word.get_add_word_count();

@@ -378,21 +378,36 @@ int ObFTRangeDict::match_with_hit(const ObString &single_word,
   return last_hit.dict_->match_with_hit(single_word, last_hit, hit);
 }
 
+static OB_INLINE uint32_t pack_utf8_char_key(const ObString &s)
+{
+  const uint8_t *p = reinterpret_cast<const uint8_t *>(s.ptr());
+  if (OB_ISNULL(p)) {
+    return 0;
+  }
+  switch (s.length()) {
+    case 3:
+      return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8);
+    case 1:
+      return (uint32_t(p[0]) << 24);
+    case 2:
+      return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16);
+    case 4:
+      return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+    default:
+      return 0;
+  }
+}
+
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
+  const uint32_t word_key = pack_utf8_char_key(single_word);
+  for (int i = 0; i < range_dicts_.size(); ++i) {
+    if (word_key >= range_dicts_[i].start_key_ && word_key <= range_dicts_[i].end_key_) {
       dict = range_dicts_[i].dict_;
       found = true;
+      break;
     }
   }
   if (!found) {
@@ -417,6 +432,8 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
       ObFTRange range;
       range.start_ = dat->start_word_;
       range.end_ = dat->end_word_;
+      range.start_key_ = pack_utf8_char_key(range.start_.get_word());
+      range.end_key_ = pack_utf8_char_key(range.end_.get_word());
       range.dict_ = dict;
       if (OB_FAIL(range_dicts_.push_back(range))) {
       }

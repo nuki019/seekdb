@@ -67,6 +67,28 @@ int ObIKFTParser::init(const ObFTParserParam &param)
   return ret;
 }
 
+int ObIKFTParser::reuse_parser(const ObFTParserParam &param)
+{
+  int ret = OB_SUCCESS;
+  if (!IS_INIT || OB_ISNULL(ctx_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_ISNULL(param.cs_) || OB_ISNULL(param.fulltext_) || param.ft_length_ <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    for (ObList<ObIIKProcessor *, ObIAllocator>::iterator iter = segmenters_.begin();
+         iter != segmenters_.end();
+         ++iter) {
+      if (OB_NOT_NULL(*iter)) {
+        (*iter)->reset_state();
+      }
+    }
+    ret = ctx_->reuse(param.fulltext_,
+                      param.ft_length_,
+                      param.ik_param_.mode_ == ObFTIKParam::Mode::SMART);
+  }
+  return ret;
+}
+
 int ObIKFTParser::get_next_token(const char *&word,
                                  int64_t &word_len,
                                  int64_t &char_cnt,
@@ -138,7 +160,7 @@ int ObIKFTParser::process_one_char(TokenizeContext &ctx,
   for (ObList<ObIIKProcessor *, ObIAllocator>::iterator iter = segmenters_.begin();
        OB_SUCC(ret) && iter != segmenters_.end();
        iter++) {
-    if (OB_FAIL((*iter)->process(ctx))) {
+    if (OB_FAIL((*iter)->do_process(ctx, ch, char_len, type))) {
     }
   }
   return ret;
@@ -178,9 +200,8 @@ int ObIKFTParser::process_next_batch()
     }
 
     if (OB_SUCC(ret) || OB_ITER_END == ret) {
-      ObIKArbitrator arb;
-      if (OB_FAIL(arb.process(*ctx_))) {
-      } else if (OB_FAIL(arb.output_result(*ctx_))) {
+      if (OB_FAIL(arb_.process(*ctx_))) {
+      } else if (OB_FAIL(arb_.output_result(*ctx_))) {
       }
     } else {
       // Already logged.
@@ -258,7 +279,6 @@ int ObIKFTParser::init_dict(const ObFTParserParam &param)
   } else {
     if (OB_FAIL(init_single_dict(main_dict_desc, cache_main_))) {
     } else if (OB_FAIL(init_single_dict(quan_dict_desc, cache_quan_))) {
-    } else if (OB_FAIL(init_single_dict(stopword_dict_desc, cache_stop_))) {
     }
   }
 
@@ -266,7 +286,6 @@ int ObIKFTParser::init_dict(const ObFTParserParam &param)
     // already logged.
   } else if (OB_FAIL(build_dict_from_cache(main_dict_desc, cache_main_, dict_main_))) {
   } else if (OB_FAIL(build_dict_from_cache(quan_dict_desc, cache_quan_, dict_quan_))) {
-  } else if (OB_FAIL(build_dict_from_cache(stopword_dict_desc, cache_stop_, dict_stop_))) {
   }
 
   return ret;

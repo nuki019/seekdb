@@ -64,6 +64,12 @@ int ObNgramFTParser::init(ObFTParserParam *param)
   return ret;
 }
 
+int ObNgramFTParser::reuse_parser(const ObFTParserParam &param)
+{
+  reset();
+  return init(const_cast<ObFTParserParam *>(&param));
+}
+
 int ObNgramFTParser::get_next_token(
     const char *&word,
     int64_t &word_len,

@@ -47,6 +47,7 @@ public:
                         int64_t param_num,
                         common::ObExprTypeCtx &type_ctx) const override;
   int cg_expr(ObExprCGCtx &op_cg_ctx, const ObRawExpr &raw_expr, ObExpr &rt_expr) const override;
+  virtual bool need_rt_ctx() const override { return true; }
 
 private:
   struct TokenizeParam

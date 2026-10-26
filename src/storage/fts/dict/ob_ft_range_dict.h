@@ -42,13 +42,15 @@ public:
         range_dicts_(&range_alloc_), range_container_(range_container)
   {
   }
-  ~ObFTRangeDict() override{};
+  ~ObFTRangeDict() override { destroy(); }
 
 public:
   struct ObFTRange final
   {
     ObFTSingleWord start_;
     ObFTSingleWord end_;
+    uint32_t start_key_;
+    uint32_t end_key_;
     ObIFTDict *dict_; // a cache dict
   };
 

@@ -18,6 +18,7 @@
 #define _OCEANBASE_STORAGE_FTS_IK_OB_IK_QUANTIFIER_PROCESSOR_H_
 
 #include "lib/allocator/ob_allocator.h"
+#include "lib/container/ob_se_array.h"
 #include "storage/fts/dict/ob_ft_dict.h"
 #include "storage/fts/ik/ob_ik_processor.h"
 
@@ -31,10 +32,17 @@ class ObIKQuantifierProcessor : public ObIIKProcessor
 {
 public:
   ObIKQuantifierProcessor(const ObIFTDict &quan_dict, ObIAllocator &alloc)
-      : quan_dict_(quan_dict), count_hits_(alloc), start_(-1), end_(-1), quan_char_cnt_(0)
+      : quan_dict_(quan_dict), count_hits_(), start_(-1), end_(-1), quan_char_cnt_(0)
   {
+    UNUSED(alloc);
   }
   ~ObIKQuantifierProcessor() override { count_hits_.reset(); }
+
+  void reset_state() override
+  {
+    count_hits_.reuse();
+    reset();
+  }
 
   int do_process(TokenizeContext &ctx,
                  const char *ch,
@@ -59,7 +67,7 @@ private:
 
 private:
   const ObIFTDict &quan_dict_;
-  ObList<ObDATrieHit, ObIAllocator> count_hits_;
+  common::ObSEArray<ObDATrieHit, 8> count_hits_;
   int64_t start_;
   int64_t end_;
   int64_t quan_char_cnt_;

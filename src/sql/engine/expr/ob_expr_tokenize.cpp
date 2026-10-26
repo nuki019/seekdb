@@ -26,6 +26,7 @@
 #include "lib/string/ob_string.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "object/ob_object.h"
+#include "sql/engine/ob_exec_context.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
 #include "share/ob_json_access_utils.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
@@ -39,6 +40,28 @@ namespace oceanbase
 {
 namespace sql
 {
+namespace
+{
+class ObExprTokenizeCtx : public ObExprOperatorCtx
+{
+public:
+  ObExprTokenizeCtx()
+    : ObExprOperatorCtx(),
+      helper_(),
+      parser_name_len_(0)
+  {
+    parser_name_buf_[0] = '\0';
+  }
+  virtual ~ObExprTokenizeCtx() override
+  {
+    helper_.reset();
+  }
+  storage::ObFTParseHelper helper_;
+  char parser_name_buf_[storage::OB_FT_PARSER_NAME_LENGTH];
+  int64_t parser_name_len_;
+};
+} // namespace
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -64,12 +87,57 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
-  } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
-                                                     ctx,
-                                                     temp_allocator,
-                                                     json_result,
-                                                     expr_datum))) {
+  } else {
+    storage::ObFTParseHelper *helper_ptr = nullptr;
+    if (expr.arg_cnt_ < 3 && expr.expr_ctx_id_ != ObExpr::INVALID_EXP_CTX_ID) {
+      ObExprTokenizeCtx *tok_ctx = static_cast<ObExprTokenizeCtx *>(
+          ctx.exec_ctx_.get_expr_op_ctx(expr.expr_ctx_id_));
+      if (OB_ISNULL(tok_ctx)) {
+        if (OB_FAIL(ctx.exec_ctx_.create_expr_op_ctx(expr.expr_ctx_id_, tok_ctx))) {
+          ret = OB_SUCCESS;
+          tok_ctx = nullptr;
+        }
+      }
+      if (OB_NOT_NULL(tok_ctx)) {
+        if (!tok_ctx->helper_.is_inited() ||
+            tok_ctx->parser_name_len_ != param.parser_name_.length() ||
+            0 != MEMCMP(tok_ctx->parser_name_buf_, param.parser_name_.ptr(), param.parser_name_.length())) {
+          tok_ctx->helper_.reset();
+          if (OB_SUCC(tok_ctx->helper_.init(&temp_allocator, param.parser_name_, param.properties_)) &&
+              param.parser_name_.length() < storage::OB_FT_PARSER_NAME_LENGTH) {
+            MEMCPY(tok_ctx->parser_name_buf_, param.parser_name_.ptr(), param.parser_name_.length());
+            tok_ctx->parser_name_len_ = param.parser_name_.length();
+            helper_ptr = &tok_ctx->helper_;
+          }
+        } else {
+          tok_ctx->helper_.set_allocator(&temp_allocator);
+          helper_ptr = &tok_ctx->helper_;
+        }
+      }
+    }
+    if (OB_NOT_NULL(helper_ptr)) {
+      const int64_t ft_word_bkt_cnt = MIN(MAX(param.fulltext_.length() / 2, 2), 997);
+      int64_t doc_len = 0;
+      storage::ObFTWordMap *token_map = nullptr;
+      if (OB_FAIL(helper_ptr->get_word_map(ft_word_bkt_cnt, token_map))) {
+      } else if ((0 != param.fulltext_.length()) &&
+                 OB_FAIL(helper_ptr->segment(param.meta_,
+                                             param.fulltext_.ptr(),
+                                             param.fulltext_.length(),
+                                             doc_len,
+                                             *token_map))) {
+      } else if (TokenizeParam::OUTPUT_MODE::DEFAULT == param.output_mode_) {
+        ret = helper_ptr->make_token_array_json(*token_map, json_result);
+      } else if (TokenizeParam::OUTPUT_MODE::ALL == param.output_mode_) {
+        ret = helper_ptr->make_detail_json(*token_map, doc_len, json_result);
+      } else {
+        ret = OB_INVALID_ARGUMENT;
+      }
+    } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
+    }
+    if (OB_SUCC(ret)) {
+      ret = ObJsonExprHelper::pack_json_res(expr, ctx, temp_allocator, json_result, expr_datum);
+    }
   }
 
   return ret;
@@ -84,14 +152,12 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
   storage::ObFTParseHelper tokenize_helper;
   const int64_t ft_word_bkt_cnt = MIN(MAX(param.fulltext_.length() / 2, 2), 997);
   int64_t doc_len = 0;
-  storage::ObFTWordMap token_map;
-
-  ObArenaAllocator tmp_parse_alloc(ObMemAttr("Tmp buffer"));
+  storage::ObFTWordMap *token_map = nullptr;
 
   if (TokenizeParam::OUTPUT_MODE::DEFAULT != mode && TokenizeParam::OUTPUT_MODE::ALL != mode) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(tokenize_helper.init(&allocator, param.parser_name_, param.properties_))) {
-  } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+  } else if (OB_FAIL(tokenize_helper.get_word_map(ft_word_bkt_cnt, token_map))) {
   } else if (
       (0 != param.fulltext_.length())
       && OB_FAIL(tokenize_helper.segment(
@@ -99,18 +165,18 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
                      param.fulltext_.ptr(),
                      param.fulltext_.length(),
                      doc_len,
-                     token_map))) {
+                     *token_map))) {
   } else {
     switch (param.output_mode_) {
     case TokenizeParam::OUTPUT_MODE::DEFAULT: {
-      if (OB_FAIL(tokenize_helper.make_token_array_json(token_map, result))) {
+      if (OB_FAIL(tokenize_helper.make_token_array_json(*token_map, result))) {
       } else {
         // pass
       }
       break;
     }
     case TokenizeParam::OUTPUT_MODE::ALL: {
-      if (OB_FAIL(tokenize_helper.make_detail_json(token_map, doc_len, result))) {
+      if (OB_FAIL(tokenize_helper.make_detail_json(*token_map, doc_len, result))) {
       } else {
         // pass
       }
@@ -200,18 +266,17 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
 {
   int ret = OB_SUCCESS;
 
-  ObDatum *parser_params_datum;
-  ObString raw_parser_name = ObString::make_string(OB_DEFAULT_FULLTEXT_PARSER_NAME);
-
-  ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
-  
-  MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator());
-
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parse_fulltext(expr, ctx, param))) {
   } else if (OB_FAIL(parse_parser_name(expr, ctx, param))) {
-  } else if (OB_FAIL(parse_parser_properties(expr, ctx, temp_allocator, param))) {
+  } else if (expr.arg_cnt_ >= 3) {
+    ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
+    MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator());
+    if (OB_FAIL(parse_parser_properties(expr, ctx, temp_allocator, param))) {
+    }
+  }
+  if (OB_FAIL(ret)) {
   } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
   } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
   }
@@ -221,6 +286,22 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
 int ObExprTokenize::construct_ft_parser_inner_name(const ObString &input_str, TokenizeParam &param)
 {
   int ret = OB_SUCCESS;
+  if (0 == input_str.case_compare("ik")) {
+    param.parser_name_ = ObString::make_string("ik.1");
+    return OB_SUCCESS;
+  } else if (0 == input_str.case_compare("beng")) {
+    param.parser_name_ = ObString::make_string("beng.1");
+    return OB_SUCCESS;
+  } else if (0 == input_str.case_compare("space")) {
+    param.parser_name_ = ObString::make_string("space.1");
+    return OB_SUCCESS;
+  } else if (0 == input_str.case_compare("ngram")) {
+    param.parser_name_ = ObString::make_string("ngram.1");
+    return OB_SUCCESS;
+  } else if (0 == input_str.case_compare("ngram2")) {
+    param.parser_name_ = ObString::make_string("ngram2.1");
+    return OB_SUCCESS;
+  }
   storage::ObFTParser parser;
 
   char *parser_name_buf = nullptr;
@@ -375,6 +456,22 @@ int ObExprTokenize::parse_parser_properties(const ObExpr &expr,
 int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &properties)
 {
   int ret = OB_SUCCESS;
+  if (properties.empty()) {
+    if (0 == parser_name_.compare("ik.1")) {
+      properties_ = ObString::make_string(
+          "{\"dict_table\":\"default_dict\",\"quantifier_table\":\"default_quantifier\",\"ik_mode\":\"smart\"}");
+      return OB_SUCCESS;
+    } else if (0 == parser_name_.compare("beng.1") || 0 == parser_name_.compare("space.1")) {
+      properties_ = ObString::make_string("{\"min_token_size\":3,\"max_token_size\":84}");
+      return OB_SUCCESS;
+    } else if (0 == parser_name_.compare("ngram.1")) {
+      properties_ = ObString::make_string("{\"ngram_token_size\":2}");
+      return OB_SUCCESS;
+    } else if (0 == parser_name_.compare("ngram2.1")) {
+      properties_ = ObString::make_string("{\"min_ngram_size\":2,\"max_ngram_size\":3}");
+      return OB_SUCCESS;
+    }
+  }
   storage::ObFTParserJsonProps parser_properties;
 
   if (OB_FAIL(parser_properties.init())) {
@@ -392,6 +489,14 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
 int ObExprTokenize::TokenizeParam::try_load_dictionary_for_ik()
 {
   int ret = OB_SUCCESS;
+  if (0 != parser_name_.compare("ik.1")) {
+    return OB_SUCCESS;
+  }
+  const ObCharsetType cs_type = ObCharset::charset_type_by_coll(meta_.get_collation_type());
+  static bool s_ik_utf8_dic_loaded = false;
+  if (CHARSET_UTF8MB4 == cs_type && ATOMIC_LOAD(&s_ik_utf8_dic_loaded)) {
+    return OB_SUCCESS;
+  }
   bool need_to_load_dic = false;
   storage::ObDicLoaderHandle dic_loader_handle;
   if (OB_FAIL(share::ObFtsIndexBuilderUtil::check_need_to_load_dic(
@@ -399,11 +504,13 @@ int ObExprTokenize::TokenizeParam::try_load_dictionary_for_ik()
   } else if (need_to_load_dic) {
     if (OB_FAIL(storage::ObGenDicLoader::get_instance().get_dic_loader(
                     ObString::make_string(storage::ObFTSLiteral::PARSER_NAME_IK), // currently only ik, use parser_name_ without version suffix
-                    ObCharset::charset_type_by_coll(meta_.get_collation_type()),
+                    cs_type,
                     dic_loader_handle))) {
     } else if (OB_UNLIKELY(!dic_loader_handle.is_valid())) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(dic_loader_handle.get_loader()->try_load_dictionary_in_trans())) {
+    } else if (CHARSET_UTF8MB4 == cs_type) {
+      ATOMIC_STORE(&s_ik_utf8_dic_loaded, true);
     }
   }
   return ret;

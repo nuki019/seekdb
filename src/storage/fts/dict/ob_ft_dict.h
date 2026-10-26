@@ -35,6 +35,12 @@ class ObIFTDict;
 class ObDATrieHit final
 {
 public:
+  ObDATrieHit()
+      : dict_(nullptr), char_cnt_(0), start_pos_(0), end_pos_(0), base_idx_(0),
+        current_check_(0), is_match_(false), is_prefix_(false)
+  {
+  }
+
   ObDATrieHit(const ObIFTDict *dict, const int64_t start_pos)
       : dict_(dict), char_cnt_(0), start_pos_(start_pos), end_pos_(start_pos_), base_idx_(0),
         current_check_(0), is_match_(false), is_prefix_(false)
@@ -63,6 +69,7 @@ public:
 
   ObDATrieHit &operator=(const ObDATrieHit &other)
   {
+    dict_ = other.dict_;
     char_cnt_ = other.char_cnt_;
     start_pos_ = other.start_pos_;
     end_pos_ = other.end_pos_;

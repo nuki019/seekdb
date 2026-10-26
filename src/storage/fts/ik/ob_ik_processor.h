@@ -18,6 +18,7 @@
 #define _OCEANBASE_STORAGE_FTS_IK_OB_IK_PROCESSOR_H_
 
 #include "lib/allocator/ob_allocator.h"
+#include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "storage/fts/ik/ob_ik_char_util.h"
@@ -39,6 +40,7 @@ public:
   ~TokenizeContext();
 
   int init();
+  int reuse(const char *fulltext, int64_t fulltext_len, bool is_smart);
   int reset_resource();
 
   int get_next_token(const char *&word, int64_t &word_len, int64_t &offset, int64_t &char_cnt);
@@ -87,6 +89,7 @@ private:
   uint32_t handle_size_;
   bool is_smart_;
 
+  common::ObArenaAllocator batch_alloc_;
   ObFTSortList token_list_;
   ObList<ObIKToken, ObIAllocator> result_list_;
 
@@ -102,6 +105,8 @@ public:
   virtual ~ObIIKProcessor() {}
 
   int process(TokenizeContext &ctx);
+
+  virtual void reset_state() {}
 
   virtual int do_process(TokenizeContext &ctx,
                          const char *ch,

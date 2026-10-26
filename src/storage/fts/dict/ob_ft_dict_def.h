@@ -40,9 +40,41 @@ public:
   ObFTSingleWord(const ObFTSingleWord &other) = default;
   ObFTSingleWord &operator=(const ObFTSingleWord &other) = default;
 
-  int32_t set_word(const char *word, int32_t word_len);
-  ObString get_word() const;
-  bool operator==(const ObFTSingleWord &other) const;
+  OB_INLINE int32_t set_word(const char *w, int32_t len)
+  {
+    int ret = common::OB_SUCCESS;
+    if (OB_ISNULL(w)) {
+      ret = common::OB_INVALID_ARGUMENT;
+    } else if (OB_UNLIKELY(len > common::ObCharset::MAX_MB_LEN)) {
+      ret = common::OB_SIZE_OVERFLOW;
+    } else {
+      for (int32_t i = 0; i < len; ++i) {
+        this->word[i] = w[i];
+      }
+      this->word_len = static_cast<uint8_t>(len);
+    }
+    return ret;
+  }
+  OB_INLINE common::ObString get_word() const { return common::ObString(word_len, word); }
+  OB_INLINE bool operator==(const ObFTSingleWord &other) const
+  {
+    if (word_len != other.word_len) {
+      return false;
+    }
+    switch (word_len) {
+      case 3:
+        return word[0] == other.word[0] && word[1] == other.word[1] && word[2] == other.word[2];
+      case 1:
+        return word[0] == other.word[0];
+      case 2:
+        return word[0] == other.word[0] && word[1] == other.word[1];
+      case 4:
+        return word[0] == other.word[0] && word[1] == other.word[1]
+               && word[2] == other.word[2] && word[3] == other.word[3];
+      default:
+        return 0 == MEMCMP(word, other.word, word_len);
+    }
+  }
 
 public:
   char word[common::ObCharset::MAX_MB_LEN];

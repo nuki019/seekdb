@@ -98,7 +98,10 @@ int ObTextWhitespaceTokenizer::get_next(ObDatum &next_token, int64_t &token_freq
     int64_t token_len = 0;
     // to next non-whitespace pos
     while (OB_SUCC(ret) && found_delimiter()) {
-      const int64_t c_len = ob_mbcharlen_ptr(cs_, doc + trav_pos_, doc + doc_len);
+      const char *cur = doc + trav_pos_;
+      const int64_t c_len = (static_cast<uint8_t>(*cur) < 0x80)
+                            ? 1
+                            : ob_mbcharlen_ptr(cs_, cur, doc + doc_len);
       trav_pos_ += c_len;
       if (trav_pos_ >= doc_len || 0 == c_len) {// if char is invalid, just skip the rest of document
         iter_end_ = true;
@@ -112,7 +115,10 @@ int ObTextWhitespaceTokenizer::get_next(ObDatum &next_token, int64_t &token_freq
 
     // to next whitespace pos
     while (OB_SUCC(ret) && !found_delimiter()) {
-      const int64_t c_len = ob_mbcharlen_ptr(cs_, doc + trav_pos_, doc + doc_len);
+      const char *cur = doc + trav_pos_;
+      const int64_t c_len = (static_cast<uint8_t>(*cur) < 0x80)
+                            ? 1
+                            : ob_mbcharlen_ptr(cs_, cur, doc + doc_len);
       trav_pos_ += c_len;
       token_len += c_len;
       if (trav_pos_ >= doc_len || 0 == c_len) {
@@ -244,7 +250,6 @@ int ObBasicEnglishNormalizer::get_next(ObDatum &next_token, int64_t &token_freq)
   } else {
     next_token.reset();
     token_freq = 0;
-    norm_allocator_.reuse();
     ObDatum tmp_datum;
     bool found_alnum = false;
     uint32_t norm_token_len = 0;
@@ -293,11 +298,27 @@ int ObBasicEnglishNormalizer::get_next(ObDatum &next_token, int64_t &token_freq)
     } else if (OB_UNLIKELY(!found_alnum)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
-      ObString norm_alnum_token(norm_token_len, norm_token_ptr);
-      ObString norm_lower_token;
-      if (OB_FAIL(ObCharset::tolower(cs_, norm_alnum_token, norm_lower_token, norm_allocator_))) {
+      bool fast_ascii = (norm_token_len <= sizeof(norm_buf_));
+      if (fast_ascii) {
+        for (uint32_t i = 0; i < norm_token_len; ++i) {
+          const uint8_t c = static_cast<uint8_t>(norm_token_ptr[i]);
+          if (OB_UNLIKELY(c >= 0x80)) {
+            fast_ascii = false;
+            break;
+          }
+          norm_buf_[i] = static_cast<char>((c >= 'A' && c <= 'Z') ? (c | 0x20) : c);
+        }
+      }
+      if (OB_LIKELY(fast_ascii)) {
+        next_token.set_string(norm_buf_, norm_token_len);
       } else {
-        next_token.set_string(norm_lower_token);
+        norm_allocator_.reuse();
+        ObString norm_alnum_token(norm_token_len, norm_token_ptr);
+        ObString norm_lower_token;
+        if (OB_FAIL(ObCharset::tolower(cs_, norm_alnum_token, norm_lower_token, norm_allocator_))) {
+        } else {
+          next_token.set_string(norm_lower_token);
+        }
       }
     }
   }

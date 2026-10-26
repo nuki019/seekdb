@@ -31,6 +31,7 @@ public:
   virtual ~ObNgram2FTParser();
 
   int init(ObFTParserParam *param);
+  virtual int reuse_parser(const ObFTParserParam &param) override;
   void reset();
   virtual int get_next_token(const char *&word,
                              int64_t &word_len,

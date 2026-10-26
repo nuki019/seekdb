@@ -35,7 +35,6 @@ int ObBEngFTParser::get_next_token(
   int ret = OB_SUCCESS;
   ObDatum token;
   int64_t token_freq = 0;
-  char *buf = nullptr;
   word = nullptr;
   word_len = 0;
   char_len = 0;
@@ -49,15 +48,31 @@ int ObBEngFTParser::get_next_token(
     }
   } else if (OB_ISNULL(token.ptr_) || OB_UNLIKELY(0 >= token.len_ || 0 >= token_freq)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_ISNULL(buf = static_cast<char *>(allocator_.alloc(token.len_)))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
-    MEMCPY(buf, token.ptr_, token.len_);
-    word = buf;
+    word = token.ptr_;
     word_len = token.len_;
     char_len = token.len_;
     word_freq = token_freq;
     LOG_DEBUG("succeed to add word", K(ObString(word_len, word)), K(word_freq));
+  }
+  return ret;
+}
+
+int ObBEngFTParser::reuse_parser(const ObFTParserParam &param)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_UNLIKELY(!param.is_valid()) || param.cs_ != analysis_ctx_.cs_) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_UNLIKELY(UINT32_MAX < param.ft_length_)) {
+    ret = OB_NOT_SUPPORTED;
+  } else {
+    doc_.set_string(param.fulltext_, param.ft_length_);
+    if (OB_FAIL(segment(doc_, token_stream_))) {
+    } else if (OB_ISNULL(token_stream_)) {
+      ret = OB_ERR_UNEXPECTED;
+    }
   }
   return ret;
 }

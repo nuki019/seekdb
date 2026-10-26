@@ -55,8 +55,12 @@ public:
 private:
   lib::MemoryContext merge_memctx_;
   ObDomainIndexRow rows_;
+  blocksstable::ObDatumRow cur_row_;
+  storage::ObFTWordMap::const_iterator word_iter_;
+  storage::ObFTWordMap::const_iterator word_end_;
   uint64_t row_idx_;
   bool is_fts_index_aux_;
+  bool has_more_words_;
   storage::ObFTParseHelper helper_;
   bool is_inited_;
 

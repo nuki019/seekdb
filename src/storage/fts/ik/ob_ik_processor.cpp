@@ -52,9 +52,11 @@ TokenizeContext::TokenizeContext(ObCollationType coll_type,
                                  int64_t fulltext_len,
                                  bool is_smart)
     : coll_type_(coll_type), fulltext_(fulltext), fulltext_len_(fulltext_len), cursor_(0),
-      next_char_len_(0), handle_size_(0), is_smart_(is_smart), token_list_(allocator),
-      result_list_(allocator)
+      next_char_len_(0), next_char_type_(ObFTCharUtil::CharType::USELESS), handle_size_(0),
+      is_smart_(is_smart), batch_alloc_(lib::ObMemAttr("IKBatchAlloc")), token_list_(batch_alloc_),
+      result_list_(batch_alloc_)
 {
+  UNUSED(allocator);
 }
 
 int TokenizeContext::init()
@@ -68,11 +70,29 @@ int TokenizeContext::init()
   return ret;
 }
 
+int TokenizeContext::reuse(const char *fulltext, int64_t fulltext_len, bool is_smart)
+{
+  int ret = OB_SUCCESS;
+  reset_resource();
+  fulltext_ = fulltext;
+  fulltext_len_ = fulltext_len;
+  cursor_ = 0;
+  next_char_len_ = 0;
+  next_char_type_ = ObFTCharUtil::CharType::USELESS;
+  is_smart_ = is_smart;
+  if (OB_ISNULL(fulltext_) || fulltext_len_ <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(prepare_next_char())) {
+  }
+  return ret;
+}
+
 int TokenizeContext::reset_resource()
 {
   handle_size_ = 0;
   result_list_.reset();
   token_list_.reset();
+  batch_alloc_.reuse();
   return OB_SUCCESS;
 }
 
@@ -101,17 +121,11 @@ int TokenizeContext::current_char_type(ObFTCharUtil::CharType &type)
 
 int TokenizeContext::prepare_next_char()
 {
-  int ret = OB_SUCCESS;
-  if (OB_FAIL(ObCharset::first_valid_char(coll_type_,
-                                          fulltext_ + cursor_,
-                                          fulltext_len_ - cursor_,
-                                          next_char_len_))) {
-  } else if (OB_FAIL(ObFTCharUtil::classify_first_char(coll_type_,
-                                                       fulltext_ + cursor_,
-                                                       next_char_len_,
-                                                       next_char_type_))) {
-  }
-  return ret;
+  return ObFTCharUtil::get_first_char_and_type(coll_type_,
+                                               fulltext_ + cursor_,
+                                               fulltext_len_ - cursor_,
+                                               next_char_len_,
+                                               next_char_type_);
 }
 
 int TokenizeContext::step_next()
@@ -174,6 +188,7 @@ TokenizeContext::~TokenizeContext()
 {
   token_list_.reset();
   result_list_.reset();
+  batch_alloc_.reset();
 }
 
 int TokenizeContext::get_next_token(const char *&word,

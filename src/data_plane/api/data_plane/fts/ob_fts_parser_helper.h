@@ -18,6 +18,7 @@
 #define OB_FTS_PARSER_HELPER_H_
 
 #include "lib/allocator/ob_fifo_allocator.h"
+#include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/string/ob_string.h"
 #include "object/ob_object.h"
@@ -204,9 +205,18 @@ public:
 
   void reset();
 
+  OB_INLINE bool is_inited() const { return is_inited_; }
+  OB_INLINE void set_allocator(common::ObIAllocator *allocator) { allocator_ = allocator; }
+  int get_word_map(const int64_t bucket_cnt, ObFTWordMap *&word_map) const;
+
   TO_STRING_KV(KP_(allocator), K_(parser_name), KP_(parser_desc), K_(is_inited));
 
 private:
+  int segment_with_reuse(
+      const ObCharsetInfo *cs,
+      const char *fulltext,
+      const int64_t fulltext_len,
+      ObAddWord &add_word) const;
   static int segment(
       const ObFTParserProperty &property,
       const int64_t parser_version,
@@ -219,6 +229,10 @@ private:
   int set_add_word_flag(const ObIFTParserDesc &ftparser_desc);
 private:
   common::ObIAllocator *allocator_;
+  mutable common::ObArenaAllocator metadata_alloc_;
+  mutable ObITokenIterator *cached_iter_;
+  mutable const ObCharsetInfo *cached_cs_;
+  mutable ObFTWordMap word_map_;
   const ObIFTParserDesc *parser_desc_;
   ObFTParser parser_name_;
   ObAddWordFlag add_word_flag_;

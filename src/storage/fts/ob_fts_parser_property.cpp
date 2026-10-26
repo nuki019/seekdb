@@ -1016,6 +1016,42 @@ int ObFTParserJsonProps::show_parser_properties(const ObFTParserJsonProps &prope
 int ObFTParserProperty::parse_for_parser_helper(const ObFTParser &parser, const ObString &json_str)
 {
   int ret = OB_SUCCESS;
+  if (parser.is_ik()) {
+    dict_table_ = ObString(ObFTSLiteral::CONFIG_NAME_DICT_TABLE);
+    stopword_table_ = ObString(ObFTSLiteral::CONFIG_NAME_STOPWORD_TABLE);
+    quantifier_table_ = ObString(ObFTSLiteral::CONFIG_NAME_QUANTIFIER_TABLE);
+    if (json_str.empty() ||
+        0 == json_str.compare("{\"ik_mode\":\"smart\"}") ||
+        0 == json_str.compare("{\"dict_table\":\"default_dict\",\"quantifier_table\":\"default_quantifier\",\"ik_mode\":\"smart\"}")) {
+      ik_mode_smart_ = true;
+      return OB_SUCCESS;
+    } else if (0 == json_str.compare("{\"ik_mode\":\"max_word\"}") ||
+               0 == json_str.compare("{\"dict_table\":\"default_dict\",\"quantifier_table\":\"default_quantifier\",\"ik_mode\":\"max_word\"}")) {
+      ik_mode_smart_ = false;
+      return OB_SUCCESS;
+    }
+  } else if (parser.is_space() || parser.is_beng()) {
+    if (json_str.empty() ||
+        0 == json_str.compare("{\"min_token_size\":3,\"max_token_size\":84}")) {
+      min_token_size_ = ObFTSLiteral::FT_DEFAULT_MIN_TOKEN_SIZE;
+      max_token_size_ = ObFTSLiteral::FT_DEFAULT_MAX_TOKEN_SIZE;
+      return OB_SUCCESS;
+    }
+  } else if (parser.is_ngram()) {
+    if (json_str.empty() ||
+        0 == json_str.compare("{\"ngram_token_size\":2}")) {
+      ngram_token_size_ = ObFTSLiteral::FT_DEFAULT_NGRAM_TOKEN_SIZE;
+      return OB_SUCCESS;
+    }
+  } else if (parser.is_ngram2()) {
+    if (json_str.empty() ||
+        0 == json_str.compare("{\"min_ngram_size\":2,\"max_ngram_size\":3}")) {
+      min_ngram_token_size_ = ObFTSLiteral::FT_DEFAULT_MIN_NGRAM_SIZE;
+      max_ngram_token_size_ = ObFTSLiteral::FT_DEFAULT_MAX_NGRAM_SIZE;
+      return OB_SUCCESS;
+    }
+  }
+
   ObFTParserJsonProps props;
   if (OB_FAIL(props.init())) {
   } else if (OB_FAIL(props.parse_from_valid_str(json_str))) {

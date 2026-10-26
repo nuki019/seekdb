@@ -40,6 +40,12 @@ int ObFTWord::hash(uint64_t &hash_val) const
 }
 bool ObFTWord::operator==(const ObFTWord &other) const
 {
+  if (OB_LIKELY(meta_.get_collation_type() == other.meta_.get_collation_type()
+                && word_.len_ == other.word_.len_
+                && (word_.ptr_ == other.word_.ptr_
+                    || (0 == word_.len_ || 0 == MEMCMP(word_.ptr_, other.word_.ptr_, word_.len_))))) {
+    return true;
+  }
   bool is_equal = false;
   int ret = OB_SUCCESS;
   int cmp_ret = 0;

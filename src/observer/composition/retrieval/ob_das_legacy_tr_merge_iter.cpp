@@ -712,8 +712,12 @@ int ObDASLegacyTRMergeIter::do_table_scan()
     } else if (OB_UNLIKELY(!check_rangekey_inited_)) {
       ret = OB_ERR_UNEXPECTED;
     }
+    const int64_t dim_iter_cnt = taat_mode_ ? 1 : query_tokens_.count();
+    const bool skip_inv_agg = ir_ctdef_->need_inv_idx_agg() && (query_tokens_.count() > 0);
     for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
-      if (OB_FAIL(children_[i]->do_table_scan())) {
+      if (skip_inv_agg && i >= dim_iter_cnt && i < 2 * dim_iter_cnt) {
+        // inv_idx_agg_iter_ is replaced by estimate_token_doc_cnt()
+      } else if (OB_FAIL(children_[i]->do_table_scan())) {
       }
     }
   }
@@ -758,8 +762,11 @@ int ObDASLegacyTRMergeIter::inner_reuse()
       if (OB_FAIL(reuse_das_iter_scan_param(inv_idx_tablet_id_, *block_max_scan_params_[i]))) {
       }
     }
+    const int64_t dim_iter_cnt = taat_mode_ ? 1 : query_tokens_.count();
+    const bool skip_inv_agg = ir_ctdef_->need_inv_idx_agg();
     for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
-      if (OB_FAIL(children_[i]->reuse())) {
+      if (skip_inv_agg && i >= dim_iter_cnt && i < 2 * dim_iter_cnt) {
+      } else if (OB_FAIL(children_[i]->reuse())) {
       }
     }
   }
@@ -787,9 +794,12 @@ int ObDASLegacyTRMergeIter::rescan()
   } else if (OB_UNLIKELY(!check_rangekey_inited_)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
+    const int64_t dim_iter_cnt = taat_mode_ ? 1 : query_tokens_.count();
+    const bool skip_inv_agg = ir_ctdef_->need_inv_idx_agg() && (query_tokens_.count() > 0);
     for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
       // TODO: update scan param
-      if (OB_FAIL(children_[i]->rescan())) {
+      if (skip_inv_agg && i >= dim_iter_cnt && i < 2 * dim_iter_cnt) {
+      } else if (OB_FAIL(children_[i]->rescan())) {
       }
     }
   }
@@ -1110,20 +1120,19 @@ int ObDASLegacyTRMergeIter::build_query_tokens(const ObDASIRScanCtDef *ir_ctdef,
     const ObObjMeta &meta = search_text->obj_meta_;
     int64_t doc_length = 0;
     storage::ObFTParseHelper tokenize_helper;
-    common::ObSEArray<ObFTWord, 16> tokens;
-    hash::ObHashMap<ObFTWord, int64_t> token_map;
+    storage::ObFTWordMap *token_map = nullptr;
     const int64_t ft_word_bkt_cnt = MAX(search_text_string.length() / 10, 2);
     if (OB_FAIL(tokenize_helper.init(&alloc, parser_name, parser_properties))) {
-    } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+    } else if (OB_FAIL(tokenize_helper.get_word_map(ft_word_bkt_cnt, token_map))) {
     } else if (OB_FAIL(tokenize_helper.segment(
                            meta,
                            search_text_string.ptr(),
                            search_text_string.length(),
                            doc_length,
-                           token_map))) {
+                           *token_map))) {
     } else {
-      for (hash::ObHashMap<ObFTWord, int64_t>::const_iterator iter = token_map.begin();
-          OB_SUCC(ret) && iter != token_map.end();
+      for (storage::ObFTWordMap::const_iterator iter = token_map->begin();
+          OB_SUCC(ret) && iter != token_map->end();
           ++iter) {
         const ObFTWord &token = iter->first;
         ObString token_string;

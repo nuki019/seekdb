@@ -18,6 +18,7 @@
 #include "ob_expr_ai_complete.h"
 #include "query/ai/ob_ai_endpoint_resolver.h"
 #include "share/rc/ob_server_runtime.h"
+#include <cmath>
 
 using namespace oceanbase::common;
 using namespace oceanbase::sql;
@@ -117,25 +118,65 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
       ObJsonObject *prompt_object = nullptr;
       bool is_null = false;
       if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, temp_allocator, PROMPT_IDX, j_base, is_null))) {
-      } else if (j_base->json_type() != ObJsonNodeType::J_OBJECT) {
+      } else if (is_null || OB_ISNULL(j_base) || j_base->json_type() != ObJsonNodeType::J_OBJECT) {
         ret = OB_INVALID_ARGUMENT;
       } else if (OB_FALSE_IT(prompt_object = static_cast<ObJsonObject *>(j_base))) {
       } else if (!ObAIFuncPromptObjectUtils::is_valid_prompt_object(prompt_object)) {
         ret = OB_INVALID_ARGUMENT;
         LOG_USER_ERROR(OB_INVALID_ARGUMENT, "prompt is not valid");
         res.set_null();
-      } else if (!ObAIFuncJsonUtils::ob_is_json_array_all_str(static_cast<ObJsonArray *>(prompt_object->get_value(ObAIFuncPromptObjectUtils::prompt_args_key)))) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "prompt object is not support");
       } else if (OB_FAIL(ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(temp_allocator, prompt_object, prompt))) {
       }
     } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, temp_allocator, *arg_prompt, expr.args_[1]->datum_meta_, expr.args_[1]->obj_meta_.has_lob_header(), prompt))) {
     }
 
     if (OB_FAIL(ret)) {
-    } else if (OB_NOT_NULL(arg_config)) {
-      if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, temp_allocator, *arg_config, expr.args_[2]->datum_meta_, expr.args_[2]->obj_meta_.has_lob_header(), config_str))) {
-      } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_object_form_str(temp_allocator, config_str, config))) {
+    } else if (expr.arg_cnt_ > CONFIG_IDX && OB_NOT_NULL(arg_config) && !arg_config->is_null()) {
+      ObIJsonBase *j_config_base = nullptr;
+      bool is_config_null = false;
+      if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, temp_allocator, CONFIG_IDX, j_config_base, is_config_null))) {
+      } else if (is_config_null || OB_ISNULL(j_config_base) || j_config_base->json_type() == ObJsonNodeType::J_NULL) {
+        config = nullptr;
+      } else if (j_config_base->json_type() != ObJsonNodeType::J_OBJECT) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, config must be a json object");
+      } else {
+        config = static_cast<ObJsonObject *>(j_config_base);
+        ObJsonNode *temp_node = config->get_value("temperature");
+        if (OB_NOT_NULL(temp_node)) {
+          ObJsonNodeType t_type = temp_node->json_type();
+          if (!share::ObJsonHelper::is_number_type(temp_node)) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, invalid temperature in config");
+          } else if ((t_type == ObJsonNodeType::J_INT && temp_node->get_int() < 0)
+                     || (t_type == ObJsonNodeType::J_OINT && temp_node->get_int() < 0)
+                     || (t_type == ObJsonNodeType::J_OLONG && temp_node->get_int() < 0)
+                     || (t_type == ObJsonNodeType::J_DOUBLE && (std::isnan(temp_node->get_double()) || std::isinf(temp_node->get_double()) || temp_node->get_double() < 0))
+                     || (t_type == ObJsonNodeType::J_ODOUBLE && (std::isnan(temp_node->get_double()) || std::isinf(temp_node->get_double()) || temp_node->get_double() < 0))
+                     || (t_type == ObJsonNodeType::J_OFLOAT && (std::isnan(temp_node->get_float()) || std::isinf(temp_node->get_float()) || temp_node->get_float() < 0))
+                     || ((t_type == ObJsonNodeType::J_DECIMAL || t_type == ObJsonNodeType::J_ODECIMAL) && temp_node->get_decimal_data().is_negative())) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, invalid temperature in config");
+          }
+        }
+        ObJsonNode *max_tokens_node = config->get_value("max_tokens");
+        if (OB_SUCC(ret) && OB_NOT_NULL(max_tokens_node)) {
+          ObJsonNodeType m_type = max_tokens_node->json_type();
+          if (m_type == ObJsonNodeType::J_INT) {
+            if (static_cast<ObJsonInt *>(max_tokens_node)->value() <= 0) {
+              ret = OB_INVALID_ARGUMENT;
+              LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, invalid max_tokens in config");
+            }
+          } else if (m_type == ObJsonNodeType::J_UINT) {
+            if (static_cast<ObJsonUint *>(max_tokens_node)->value() == 0) {
+              ret = OB_INVALID_ARGUMENT;
+              LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, invalid max_tokens in config");
+            }
+          } else {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, invalid max_tokens in config");
+          }
+        }
       }
     }
 
