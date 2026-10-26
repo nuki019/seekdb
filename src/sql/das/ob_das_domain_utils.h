@@ -20,6 +20,7 @@
 #include "lib/allocator/page_arena.h"
 #include "lib/hash/ob_hashset.h"
 #include "common/datum/ob_datum.h"
+#include "storage/blocksstable/ob_datum_row.h"
 #include "sql/das/ob_das_dml_ctx_define.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "data_plane/fts/ob_fts_doc_word_scan.h"
@@ -200,7 +201,6 @@ public:
       const IntFixedArray &row_projector,
       const ObDASWriteBuffer::DmlRow &dml_row,
       ObDomainIndexRow &domain_rows);
-private:
   static int segment_and_calc_word_count(
       common::ObIAllocator &allocator,
       storage::ObFTParseHelper *helper,
@@ -208,6 +208,7 @@ private:
       const ObString &fulltext,
       int64_t &doc_length,
       storage::ObFTWordMap &words_count);
+private:
   static int calc_save_rowkey_policy(
     ObIAllocator &allocator,
     const ObDASDMLBaseCtDef &das_ctdef,

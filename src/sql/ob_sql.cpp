@@ -4445,10 +4445,32 @@ static int rewrite_select_file_funcs(const std::string &sql, std::string &rewrit
 namespace ai_column
 {
 
-using file_sql::trim_ws;
 using file_sql::str_tolower;
 using file_sql::is_ident_char;
-using file_sql::sql_escape;
+
+static std::string trim_ws(const std::string &s)
+{
+  return file_sql::str_trim(s);
+}
+
+static std::string sql_escape(const std::string &s)
+{
+  std::string out;
+  out.reserve(s.size() + 8);
+  for (size_t i = 0; i < s.size(); ++i) {
+    char c = s[i];
+    if (c == '\'') {
+      out.append("''");
+    } else if (c == '\\') {
+      out.append("\\\\");
+    } else if (c == '\0') {
+      out.append("\\0");
+    } else {
+      out.push_back(c);
+    }
+  }
+  return out;
+}
 
 static thread_local bool g_in_ai_column_internal = false;
 static std::once_flag g_ai_worker_once;
@@ -4591,13 +4613,13 @@ static int exec_session_sql(ObSql *sql_engine,
     ObSqlCtx inner_ctx = base_ctx;
     ObSchemaGetterGuard latest_guard;
     if (OB_NOT_NULL(GCTX.schema_service_)) {
-      if (OB_SUCC(GCTX.schema_service_->get_tenant_schema_guard(session.get_effective_tenant_id(), latest_guard))) {
+      if (OB_SUCC(GCTX.schema_service_->get_runtime_schema_guard(latest_guard))) {
         inner_ctx.schema_guard_ = &latest_guard;
       }
     }
     ObString inner_sql_str(static_cast<int32_t>(sql.size()), sql.c_str());
     if (OB_FAIL(inner_rs->init())) {
-    } else if (OB_FAIL(sql_engine->handle_text_query(inner_sql_str, inner_ctx, *inner_rs))) {
+    } else if (OB_FAIL(sql_engine->stmt_query(inner_sql_str, inner_ctx, *inner_rs))) {
     } else if (OB_FAIL(inner_rs->open())) {
       int cli_ret = OB_SUCCESS;
       (void)inner_rs->close(cli_ret);
@@ -4861,6 +4883,7 @@ static int load_all_ai_columns(std::vector<AiColumnMeta> &out_cols)
 
 static int load_table_pk_columns(uint64_t table_id, std::vector<std::string> &pk_cols)
 {
+  int ret = OB_SUCCESS;
   pk_cols.clear();
   std::string sql =
       "SELECT column_name FROM oceanbase.__all_column "
@@ -4943,6 +4966,7 @@ static bool is_vector_col_type(const std::string &col_type, int64_t &dim_out)
 
 static void ai_worker_process_once()
 {
+  int ret = OB_SUCCESS;
   if (!g_ai_meta_tables_ready.load(std::memory_order_acquire)) {
     return;
   }
@@ -5142,6 +5166,7 @@ static void ai_worker_process_once()
 static void ai_worker_loop()
 {
   while (true) {
+    int ret = OB_SUCCESS;
     std::this_thread::sleep_for(std::chrono::milliseconds(40));
     if (OB_ISNULL(GCTX.sql_proxy_) || !GCTX.sql_proxy_->is_inited()) {
       continue;
@@ -5942,6 +5967,7 @@ static int handle_alter_table_ai_column(ObSql *sql_engine,
         "JOIN oceanbase.__all_database d ON d.database_id = t.database_id "
         "WHERE d.database_name = '" + sql_escape(db_name) + "' "
         "AND t.table_name = '" + sql_escape(table_name) + "' AND c.is_hidden = 0";
+    int ret = OB_SUCCESS;
     std::vector<QueryRow> col_rows;
     if (OB_SUCC(proxy_exec_read(col_sql, 1, col_rows))) {
       for (size_t ci = 0; ci < col_rows.size(); ++ci) {
@@ -5953,7 +5979,7 @@ static int handle_alter_table_ai_column(ObSql *sql_engine,
     }
 
     ParsedAiColumnDef def;
-    int ret = parse_ai_column_def(col_def, regular_cols_low, ai_cols_low, def);
+    ret = parse_ai_column_def(col_def, regular_cols_low, ai_cols_low, def);
     if (OB_FAIL(ret)) {
       return ret;
     }
@@ -6076,6 +6102,7 @@ static int check_strict_read_for_sql(ObSql *sql_engine,
                                      const std::string &raw_sql,
                                      const std::string &default_db)
 {
+  int ret = OB_SUCCESS;
   int64_t strict_read = 0;
   if (OB_FAIL(session.get_sys_variable(share::SYS_VAR_AI_COLUMN_STRICT_READ, strict_read)) || 0 == strict_read) {
     return OB_SUCCESS;
