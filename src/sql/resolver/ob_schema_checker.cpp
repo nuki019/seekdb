@@ -375,7 +375,7 @@ int ObSchemaChecker::get_column_schema(
       } else {
         column_schema = column;
       }
-    } else if (!get_hidden && column->is_hidden()) {
+    } else if (!get_hidden && column->is_hidden() && !column->get_column_name_str().prefix_match("__ai_col_")) {
       ret = OB_ERR_BAD_FIELD_ERROR;
       LOG_INFO("do not get hidden column", K(table_id), K(column_name), K(ret));
     } else {
@@ -404,7 +404,7 @@ int ObSchemaChecker::get_column_schema(
   } else if (OB_FAIL(get_column_schema_inner(table_id, column_id, column, is_link))) {
   } else if (NULL == column) {
     ret = OB_ERR_BAD_FIELD_ERROR;
-  } else if (!get_hidden && column->is_hidden()) {
+  } else if (!get_hidden && column->is_hidden() && !column->get_column_name_str().prefix_match("__ai_col_")) {
     ret = OB_ERR_BAD_FIELD_ERROR;
     LOG_INFO("do not get hidden column", K(table_id), K(column_id), K(ret));
   } else {

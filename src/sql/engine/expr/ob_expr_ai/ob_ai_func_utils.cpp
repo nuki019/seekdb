@@ -1251,6 +1251,8 @@ int ObAIFuncJsonUtils::compact_json_object(ObIAllocator &allocator, ObJsonObject
       if (OB_ISNULL(j_node)) {
         ret = OB_ERR_UNEXPECTED;
       } else if (OB_FAIL(obj_node->get_key(i, key))) {
+      } else if (0 == key.case_compare("system_prompt")) {
+        // system_prompt is passed in messages array
       } else if (OB_FAIL(compact_obj->add(key, j_node))) {
       }
     }
@@ -1552,6 +1554,13 @@ int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObStr
   ObAIFuncClient client;
   ObString unencrypted_access_key;
   ObString request_model_name = get_request_model_name();
+  if (OB_NOT_NULL(config)) {
+    ObJsonNode *sys_prompt_node = config->get_value("system_prompt");
+    if (OB_NOT_NULL(sys_prompt_node) && sys_prompt_node->json_type() == ObJsonNodeType::J_STRING) {
+      prompt_str.assign_ptr(static_cast<const char *>(sys_prompt_node->get_data()),
+                            static_cast<int32_t>(sys_prompt_node->get_data_length()));
+    }
+  }
   if (!is_completion_type()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, info type is not completion");
@@ -1595,6 +1604,13 @@ int ObAIFuncModel::call_completion_vector(ObArray<ObString> &prompts, ObJsonObje
   ObAIFuncClient client;
   ObString unencrypted_access_key;
   ObString request_model_name = get_request_model_name();
+  if (OB_NOT_NULL(config)) {
+    ObJsonNode *sys_prompt_node = config->get_value("system_prompt");
+    if (OB_NOT_NULL(sys_prompt_node) && sys_prompt_node->json_type() == ObJsonNodeType::J_STRING) {
+      prompt_str.assign_ptr(static_cast<const char *>(sys_prompt_node->get_data()),
+                            static_cast<int32_t>(sys_prompt_node->get_data_length()));
+    }
+  }
   if (!is_completion_type()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, info type is not completion");

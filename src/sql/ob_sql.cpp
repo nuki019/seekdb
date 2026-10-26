@@ -48,6 +48,11 @@
 #include <vector>
 #include <algorithm>
 #include <map>
+#include <set>
+#include <mutex>
+#include <atomic>
+#include <thread>
+#include <chrono>
 #ifdef _WIN32
 #include <io.h>
 #else
@@ -4437,6 +4442,1983 @@ static int rewrite_select_file_funcs(const std::string &sql, std::string &rewrit
 
 } // namespace file_sql
 
+namespace ai_column
+{
+
+using file_sql::trim_ws;
+using file_sql::str_tolower;
+using file_sql::is_ident_char;
+using file_sql::sql_escape;
+
+static thread_local bool g_in_ai_column_internal = false;
+static std::once_flag g_ai_worker_once;
+static std::atomic<bool> g_ai_meta_tables_ready{false};
+static std::atomic<int64_t> g_ai_req_counter{1000};
+static std::mutex g_in_flight_mu;
+static std::set<std::string> g_in_flight_groups;
+
+struct ScopedInternalGuard
+{
+  bool prev_;
+  ScopedInternalGuard() : prev_(g_in_ai_column_internal) { g_in_ai_column_internal = true; }
+  ~ScopedInternalGuard() { g_in_ai_column_internal = prev_; }
+};
+
+static int64_t next_request_id()
+{
+  int64_t now_us = ObTimeUtility::current_time();
+  int64_t seq = g_ai_req_counter.fetch_add(1, std::memory_order_relaxed);
+  return (now_us / 1000LL) * 1000LL + (seq % 1000LL);
+}
+
+static std::string unquote_ident(const std::string &s)
+{
+  std::string t = trim_ws(s);
+  if (t.size() >= 2 && ((t.front() == '`' && t.back() == '`')
+                        || (t.front() == '\'' && t.back() == '\'')
+                        || (t.front() == '"' && t.back() == '"'))) {
+    return t.substr(1, t.size() - 2);
+  }
+  return t;
+}
+
+static std::string quote_ident(const std::string &s)
+{
+  return "`" + unquote_ident(s) + "`";
+}
+
+static std::string strip_trailing_semicolon(const std::string &sql)
+{
+  std::string s = trim_ws(sql);
+  while (!s.empty() && s.back() == ';') {
+    s.pop_back();
+    s = trim_ws(s);
+  }
+  return s;
+}
+
+static void split_qualified_table_name(const std::string &raw,
+                                       const std::string &default_db,
+                                       std::string &db_out,
+                                       std::string &tbl_out)
+{
+  std::string s = trim_ws(raw);
+  bool in_bt = false;
+  size_t dot_pos = std::string::npos;
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '`') {
+      in_bt = !in_bt;
+    } else if (!in_bt && s[i] == '.') {
+      dot_pos = i;
+      break;
+    }
+  }
+  if (dot_pos != std::string::npos) {
+    db_out = unquote_ident(s.substr(0, dot_pos));
+    tbl_out = unquote_ident(s.substr(dot_pos + 1));
+  } else {
+    db_out = default_db;
+    tbl_out = unquote_ident(s);
+  }
+}
+
+static std::string obj_to_string(const ObObj &cell)
+{
+  if (cell.is_null()) {
+    return "";
+  }
+  if (cell.is_string_type()) {
+    ObString s = cell.get_string();
+    return std::string(NULL != s.ptr() ? s.ptr() : "", static_cast<size_t>(s.length()));
+  }
+  if (cell.get_type_class() == ObIntTC) {
+    return std::to_string(cell.get_int());
+  }
+  if (cell.get_type_class() == ObUIntTC) {
+    return std::to_string(cell.get_uint64());
+  }
+  char buf[16384];
+  int64_t pos = 0;
+  ObObjPrintParams print_params;
+  print_params.use_memcpy_ = true;
+  print_params.cs_type_ = CS_TYPE_UTF8MB4_GENERAL_CI;
+  if (OB_SUCCESS == cell.print_plain_str_literal(buf, sizeof(buf), pos, print_params) && pos > 0) {
+    return std::string(buf, static_cast<size_t>(pos));
+  }
+  return "";
+}
+
+static std::string obj_to_sql_literal(const ObObj &cell)
+{
+  if (cell.is_null()) {
+    return "NULL";
+  }
+  if (cell.get_type_class() == ObIntTC) {
+    return std::to_string(cell.get_int());
+  }
+  if (cell.get_type_class() == ObUIntTC) {
+    return std::to_string(cell.get_uint64());
+  }
+  std::string s = obj_to_string(cell);
+  return "'" + sql_escape(s) + "'";
+}
+
+struct QueryRow
+{
+  std::vector<ObObj> cells;
+  std::vector<std::string> str_vals;
+  std::vector<bool> is_nulls;
+};
+
+static int exec_session_sql(ObSql *sql_engine,
+                            query::ObIPlanCacheAccessService *pc_service,
+                            ObSQLSessionInfo &session,
+                            ObSqlCtx &base_ctx,
+                            const std::string &sql,
+                            std::vector<QueryRow> *out_rows = NULL,
+                            bool refresh_schema_after = false)
+{
+  int ret = OB_SUCCESS;
+  ScopedInternalGuard guard;
+  ObArenaAllocator inner_alloc(ObModIds::OB_SQL_EXECUTOR, OB_MALLOC_NORMAL_BLOCK_SIZE);
+  ObResultSet *inner_rs = OB_NEWx(ObResultSet, (&inner_alloc), session, inner_alloc, *pc_service);
+  if (OB_ISNULL(inner_rs)) {
+    return OB_ALLOCATE_MEMORY_FAILED;
+  }
+  {
+    LinkExecCtxGuard inner_guard(session, inner_rs->get_exec_context());
+    inner_rs->get_exec_context().get_sql_exec_ctx().schema_service_ = GCTX.schema_service_;
+    ObSqlCtx inner_ctx = base_ctx;
+    ObSchemaGetterGuard latest_guard;
+    if (OB_NOT_NULL(GCTX.schema_service_)) {
+      if (OB_SUCC(GCTX.schema_service_->get_tenant_schema_guard(session.get_effective_tenant_id(), latest_guard))) {
+        inner_ctx.schema_guard_ = &latest_guard;
+      }
+    }
+    ObString inner_sql_str(static_cast<int32_t>(sql.size()), sql.c_str());
+    if (OB_FAIL(inner_rs->init())) {
+    } else if (OB_FAIL(sql_engine->handle_text_query(inner_sql_str, inner_ctx, *inner_rs))) {
+    } else if (OB_FAIL(inner_rs->open())) {
+      int cli_ret = OB_SUCCESS;
+      (void)inner_rs->close(cli_ret);
+    } else {
+      if (NULL != out_rows && inner_rs->is_with_rows()) {
+        const ObNewRow *row = NULL;
+        while (OB_SUCC(ret) && OB_SUCC(inner_rs->get_next_row(row))) {
+          if (OB_ISNULL(row)) {
+            ret = OB_ERR_UNEXPECTED;
+            break;
+          }
+          QueryRow qrow;
+          for (int64_t j = 0; j < row->get_count(); ++j) {
+            const ObObj &cell = row->get_cell(j);
+            qrow.cells.push_back(cell);
+            qrow.is_nulls.push_back(cell.is_null());
+            qrow.str_vals.push_back(obj_to_string(cell));
+          }
+          out_rows->push_back(qrow);
+        }
+        if (OB_ITER_END == ret) {
+          ret = OB_SUCCESS;
+        }
+      }
+      int close_ret = inner_rs->close();
+      if (OB_SUCC(ret) && OB_FAIL(close_ret)) {
+        ret = close_ret;
+      }
+    }
+  }
+  inner_rs->~ObResultSet();
+  if (refresh_schema_after) {
+    session.get_cached_schema_guard_info().reset();
+  }
+  return ret;
+}
+
+static int proxy_exec_write(const std::string &sql)
+{
+  if (OB_ISNULL(GCTX.sql_proxy_) || !GCTX.sql_proxy_->is_inited()) {
+    return OB_NOT_INIT;
+  }
+  ScopedInternalGuard guard;
+  int64_t affected_rows = 0;
+  return GCTX.sql_proxy_->write(sql.c_str(), affected_rows);
+}
+
+static int proxy_exec_read(const std::string &sql, int64_t num_cols, std::vector<QueryRow> &out_rows)
+{
+  int ret = OB_SUCCESS;
+  out_rows.clear();
+  if (OB_ISNULL(GCTX.sql_proxy_) || !GCTX.sql_proxy_->is_inited()) {
+    return OB_NOT_INIT;
+  }
+  ScopedInternalGuard guard;
+  SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+    sqlclient::ObMySQLResult *result = NULL;
+    if (OB_FAIL(GCTX.sql_proxy_->read(res, sql.c_str()))) {
+    } else if (OB_ISNULL(result = res.get_result())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      while (OB_SUCC(ret) && OB_SUCC(result->next())) {
+        QueryRow qrow;
+        for (int64_t j = 0; j < num_cols; ++j) {
+          ObObj cell;
+          if (OB_FAIL(result->get_obj(j, cell))) {
+            break;
+          }
+          qrow.cells.push_back(cell);
+          qrow.is_nulls.push_back(cell.is_null());
+          qrow.str_vals.push_back(obj_to_string(cell));
+        }
+        if (OB_SUCC(ret)) {
+          out_rows.push_back(qrow);
+        }
+      }
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+      }
+    }
+  }
+  return ret;
+}
+
+static int ensure_metadata_tables_exist()
+{
+  if (g_ai_meta_tables_ready.load(std::memory_order_acquire)) {
+    return OB_SUCCESS;
+  }
+  const char *create_meta_sql =
+      "CREATE TABLE IF NOT EXISTS oceanbase.__all_ai_column ("
+      "table_id BIGINT NOT NULL,"
+      "column_id BIGINT NOT NULL,"
+      "column_name VARCHAR(128) NOT NULL,"
+      "state_column_id BIGINT NOT NULL,"
+      "request_column_id BIGINT NOT NULL,"
+      "result_spec_column_id BIGINT NOT NULL,"
+      "sync_mode VARCHAR(32) NOT NULL DEFAULT 'async',"
+      "max_retries INT NOT NULL DEFAULT 3,"
+      "normalized_expr VARCHAR(2048),"
+      "ai_func_name VARCHAR(64),"
+      "model_name VARCHAR(256),"
+      "arg_expr VARCHAR(2048),"
+      "col_type VARCHAR(128),"
+      "dep_columns VARCHAR(1024),"
+      "PRIMARY KEY (table_id, column_id))";
+  const char *create_task_sql =
+      "CREATE TABLE IF NOT EXISTS oceanbase.__all_ai_column_task ("
+      "table_id BIGINT NOT NULL,"
+      "column_id BIGINT NOT NULL,"
+      "rowkey_predicate VARCHAR(512) NOT NULL,"
+      "request_id BIGINT NOT NULL,"
+      "state INT NOT NULL DEFAULT 1,"
+      "retry_count INT NOT NULL DEFAULT 0,"
+      "eligible_ts DATETIME(6) NOT NULL,"
+      "PRIMARY KEY (table_id, column_id, rowkey_predicate))";
+  int ret = proxy_exec_write(create_meta_sql);
+  if (OB_SUCC(ret)) {
+    ret = proxy_exec_write(create_task_sql);
+  }
+  if (OB_SUCC(ret)) {
+    g_ai_meta_tables_ready.store(true, std::memory_order_release);
+  }
+  return ret;
+}
+
+struct AiColumnMeta
+{
+  uint64_t table_id = 0;
+  uint64_t column_id = 0;
+  std::string db_name;
+  std::string table_name;
+  std::string column_name;
+  uint64_t state_column_id = 0;
+  uint64_t request_column_id = 0;
+  uint64_t result_spec_column_id = 0;
+  std::string sync_mode = "async";
+  int32_t max_retries = 3;
+  std::string normalized_expr;
+  std::string ai_func_name;
+  std::string model_name;
+  std::string arg_expr;
+  std::string col_type;
+  std::vector<std::string> dep_columns;
+};
+
+static std::vector<std::string> split_csv(const std::string &s)
+{
+  std::vector<std::string> out;
+  size_t start = 0;
+  while (start <= s.size()) {
+    size_t pos = s.find(',', start);
+    std::string item = trim_ws(pos == std::string::npos ? s.substr(start) : s.substr(start, pos - start));
+    if (!item.empty()) {
+      out.push_back(item);
+    }
+    if (pos == std::string::npos) {
+      break;
+    }
+    start = pos + 1;
+  }
+  return out;
+}
+
+static int load_table_ai_columns(const std::string &db_name,
+                                 const std::string &table_name,
+                                 std::vector<AiColumnMeta> &out_cols)
+{
+  out_cols.clear();
+  if (!g_ai_meta_tables_ready.load(std::memory_order_acquire)) {
+    return OB_SUCCESS;
+  }
+  std::string sql =
+      "SELECT a.table_id, a.column_id, a.column_name, a.state_column_id, a.request_column_id, "
+      "a.result_spec_column_id, a.sync_mode, a.max_retries, a.normalized_expr, a.ai_func_name, "
+      "a.model_name, a.arg_expr, a.col_type, a.dep_columns "
+      "FROM oceanbase.__all_ai_column a "
+      "JOIN oceanbase.__all_table t ON t.table_id = a.table_id "
+      "JOIN oceanbase.__all_database d ON d.database_id = t.database_id "
+      "WHERE d.database_name = '" + sql_escape(db_name) + "' "
+      "AND t.table_name = '" + sql_escape(table_name) + "' "
+      "ORDER BY a.column_id ASC";
+  std::vector<QueryRow> rows;
+  int ret = proxy_exec_read(sql, 14, rows);
+  if (OB_FAIL(ret)) {
+    return OB_SUCCESS;
+  }
+  for (size_t i = 0; i < rows.size(); ++i) {
+    const QueryRow &r = rows[i];
+    if (r.str_vals.size() < 14) {
+      continue;
+    }
+    AiColumnMeta m;
+    m.table_id = static_cast<uint64_t>(std::strtoull(r.str_vals[0].c_str(), NULL, 10));
+    m.column_id = static_cast<uint64_t>(std::strtoull(r.str_vals[1].c_str(), NULL, 10));
+    m.db_name = db_name;
+    m.table_name = table_name;
+    m.column_name = r.str_vals[2];
+    m.state_column_id = static_cast<uint64_t>(std::strtoull(r.str_vals[3].c_str(), NULL, 10));
+    m.request_column_id = static_cast<uint64_t>(std::strtoull(r.str_vals[4].c_str(), NULL, 10));
+    m.result_spec_column_id = static_cast<uint64_t>(std::strtoull(r.str_vals[5].c_str(), NULL, 10));
+    m.sync_mode = r.str_vals[6];
+    m.max_retries = static_cast<int32_t>(std::strtol(r.str_vals[7].c_str(), NULL, 10));
+    m.normalized_expr = r.str_vals[8];
+    m.ai_func_name = r.str_vals[9];
+    m.model_name = r.str_vals[10];
+    m.arg_expr = r.str_vals[11];
+    m.col_type = r.str_vals[12];
+    m.dep_columns = split_csv(r.str_vals[13]);
+    out_cols.push_back(m);
+  }
+  return OB_SUCCESS;
+}
+
+static int load_all_ai_columns(std::vector<AiColumnMeta> &out_cols)
+{
+  out_cols.clear();
+  if (!g_ai_meta_tables_ready.load(std::memory_order_acquire)) {
+    return OB_SUCCESS;
+  }
+  std::string sql =
+      "SELECT a.table_id, a.column_id, d.database_name, t.table_name, a.column_name, "
+      "a.state_column_id, a.request_column_id, a.result_spec_column_id, a.sync_mode, "
+      "a.max_retries, a.normalized_expr, a.ai_func_name, a.model_name, a.arg_expr, "
+      "a.col_type, a.dep_columns "
+      "FROM oceanbase.__all_ai_column a "
+      "JOIN oceanbase.__all_table t ON t.table_id = a.table_id "
+      "JOIN oceanbase.__all_database d ON d.database_id = t.database_id "
+      "ORDER BY a.table_id ASC, a.column_id ASC";
+  std::vector<QueryRow> rows;
+  int ret = proxy_exec_read(sql, 16, rows);
+  if (OB_FAIL(ret)) {
+    return OB_SUCCESS;
+  }
+  for (size_t i = 0; i < rows.size(); ++i) {
+    const QueryRow &r = rows[i];
+    if (r.str_vals.size() < 16) {
+      continue;
+    }
+    AiColumnMeta m;
+    m.table_id = static_cast<uint64_t>(std::strtoull(r.str_vals[0].c_str(), NULL, 10));
+    m.column_id = static_cast<uint64_t>(std::strtoull(r.str_vals[1].c_str(), NULL, 10));
+    m.db_name = r.str_vals[2];
+    m.table_name = r.str_vals[3];
+    m.column_name = r.str_vals[4];
+    m.state_column_id = static_cast<uint64_t>(std::strtoull(r.str_vals[5].c_str(), NULL, 10));
+    m.request_column_id = static_cast<uint64_t>(std::strtoull(r.str_vals[6].c_str(), NULL, 10));
+    m.result_spec_column_id = static_cast<uint64_t>(std::strtoull(r.str_vals[7].c_str(), NULL, 10));
+    m.sync_mode = r.str_vals[8];
+    m.max_retries = static_cast<int32_t>(std::strtol(r.str_vals[9].c_str(), NULL, 10));
+    m.normalized_expr = r.str_vals[10];
+    m.ai_func_name = r.str_vals[11];
+    m.model_name = r.str_vals[12];
+    m.arg_expr = r.str_vals[13];
+    m.col_type = r.str_vals[14];
+    m.dep_columns = split_csv(r.str_vals[15]);
+    out_cols.push_back(m);
+  }
+  return OB_SUCCESS;
+}
+
+static int load_table_pk_columns(uint64_t table_id, std::vector<std::string> &pk_cols)
+{
+  pk_cols.clear();
+  std::string sql =
+      "SELECT column_name FROM oceanbase.__all_column "
+      "WHERE table_id = " + std::to_string(table_id) + " "
+      "AND rowkey_position > 0 AND is_hidden = 0 "
+      "ORDER BY rowkey_position ASC";
+  std::vector<QueryRow> rows;
+  if (OB_SUCC(proxy_exec_read(sql, 1, rows)) && !rows.empty()) {
+    for (size_t i = 0; i < rows.size(); ++i) {
+      pk_cols.push_back(rows[i].str_vals[0]);
+    }
+    return OB_SUCCESS;
+  }
+  std::string fallback_sql =
+      "SELECT column_name FROM oceanbase.__all_column "
+      "WHERE table_id = " + std::to_string(table_id) + " "
+      "AND rowkey_position > 0 "
+      "ORDER BY rowkey_position ASC";
+  if (OB_SUCC(proxy_exec_read(fallback_sql, 1, rows))) {
+    for (size_t i = 0; i < rows.size(); ++i) {
+      pk_cols.push_back(rows[i].str_vals[0]);
+    }
+  }
+  return OB_SUCCESS;
+}
+
+static std::string build_pk_select_list(const std::vector<std::string> &pk_cols)
+{
+  std::string out;
+  for (size_t i = 0; i < pk_cols.size(); ++i) {
+    if (i > 0) {
+      out += ", ";
+    }
+    out += quote_ident(pk_cols[i]);
+  }
+  return out;
+}
+
+static std::string build_rowkey_predicate(const std::vector<std::string> &pk_cols,
+                                          const QueryRow &row)
+{
+  std::string pred;
+  for (size_t i = 0; i < pk_cols.size() && i < row.cells.size(); ++i) {
+    if (i > 0) {
+      pred += " AND ";
+    }
+    pred += quote_ident(pk_cols[i]) + " = " + obj_to_sql_literal(row.cells[i]);
+  }
+  return pred;
+}
+
+static bool is_integer_col_type(const std::string &col_type)
+{
+  std::string low = str_tolower(trim_ws(col_type));
+  return low.find("int") == 0 || low.find("bigint") == 0 || low.find("smallint") == 0
+      || low.find("tinyint") == 0 || low.find("mediumint") == 0 || low.find("integer") == 0;
+}
+
+static bool is_json_col_type(const std::string &col_type)
+{
+  std::string low = str_tolower(trim_ws(col_type));
+  return low.find("json") == 0;
+}
+
+static bool is_vector_col_type(const std::string &col_type, int64_t &dim_out)
+{
+  dim_out = -1;
+  std::string low = str_tolower(trim_ws(col_type));
+  if (low.find("vector") != 0) {
+    return false;
+  }
+  size_t lp = low.find('(');
+  size_t rp = low.find(')', lp == std::string::npos ? 0 : lp + 1);
+  if (lp != std::string::npos && rp != std::string::npos && rp > lp + 1) {
+    std::string dim_str = trim_ws(low.substr(lp + 1, rp - lp - 1));
+    dim_out = std::strtoll(dim_str.c_str(), NULL, 10);
+  }
+  return true;
+}
+
+static void ai_worker_process_once()
+{
+  if (!g_ai_meta_tables_ready.load(std::memory_order_acquire)) {
+    return;
+  }
+  std::string task_sql =
+      "SELECT t.table_id, t.column_id, t.rowkey_predicate, t.request_id, t.state, t.retry_count "
+      "FROM oceanbase.__all_ai_column_task t "
+      "WHERE t.eligible_ts <= NOW(6) "
+      "ORDER BY t.table_id ASC, t.rowkey_predicate ASC, t.request_id ASC, t.column_id ASC";
+  std::vector<QueryRow> task_rows;
+  if (OB_FAIL(proxy_exec_read(task_sql, 6, task_rows)) || task_rows.empty()) {
+    return;
+  }
+
+  std::vector<AiColumnMeta> all_metas;
+  load_all_ai_columns(all_metas);
+  std::map<std::pair<uint64_t, uint64_t>, AiColumnMeta> meta_map;
+  for (size_t i = 0; i < all_metas.size(); ++i) {
+    meta_map[std::make_pair(all_metas[i].table_id, all_metas[i].column_id)] = all_metas[i];
+  }
+
+  struct TaskItem
+  {
+    uint64_t table_id = 0;
+    uint64_t column_id = 0;
+    std::string rowkey_predicate;
+    int64_t request_id = 0;
+    int32_t state = 1;
+    int32_t retry_count = 0;
+  };
+  struct TaskGroup
+  {
+    uint64_t table_id = 0;
+    std::string rowkey_predicate;
+    int64_t request_id = 0;
+    std::string group_key;
+    std::vector<TaskItem> items;
+  };
+
+  std::vector<TaskGroup> groups;
+  for (size_t i = 0; i < task_rows.size(); ++i) {
+    const QueryRow &r = task_rows[i];
+    if (r.str_vals.size() < 6) {
+      continue;
+    }
+    TaskItem item;
+    item.table_id = static_cast<uint64_t>(std::strtoull(r.str_vals[0].c_str(), NULL, 10));
+    item.column_id = static_cast<uint64_t>(std::strtoull(r.str_vals[1].c_str(), NULL, 10));
+    item.rowkey_predicate = r.str_vals[2];
+    item.request_id = static_cast<int64_t>(std::strtoll(r.str_vals[3].c_str(), NULL, 10));
+    item.state = static_cast<int32_t>(std::strtol(r.str_vals[4].c_str(), NULL, 10));
+    item.retry_count = static_cast<int32_t>(std::strtol(r.str_vals[5].c_str(), NULL, 10));
+
+    std::string gkey = std::to_string(item.table_id) + "|" + item.rowkey_predicate + "|" + std::to_string(item.request_id);
+    if (groups.empty() || groups.back().group_key != gkey) {
+      TaskGroup g;
+      g.table_id = item.table_id;
+      g.rowkey_predicate = item.rowkey_predicate;
+      g.request_id = item.request_id;
+      g.group_key = gkey;
+      groups.push_back(g);
+    }
+    groups.back().items.push_back(item);
+  }
+
+  for (size_t gi = 0; gi < groups.size(); ++gi) {
+    TaskGroup &grp = groups[gi];
+    {
+      std::lock_guard<std::mutex> lk(g_in_flight_mu);
+      if (g_in_flight_groups.count(grp.group_key) > 0) {
+        continue;
+      }
+      g_in_flight_groups.insert(grp.group_key);
+    }
+
+    bool group_stale = false;
+    bool group_failed = false;
+    std::string db_name;
+    std::string table_name;
+    std::vector<std::pair<AiColumnMeta, std::string>> computed_cols;
+
+    for (size_t ii = 0; ii < grp.items.size(); ++ii) {
+      const TaskItem &item = grp.items[ii];
+      auto it = meta_map.find(std::make_pair(item.table_id, item.column_id));
+      if (it == meta_map.end()) {
+        group_stale = true;
+        break;
+      }
+      const AiColumnMeta &meta = it->second;
+      db_name = meta.db_name;
+      table_name = meta.table_name;
+      std::string req_col = "__ai_col_req_" + meta.column_name;
+      std::string eval_sql =
+          "SELECT CAST((" + meta.normalized_expr + ") AS CHAR(4000)) "
+          "FROM " + quote_ident(db_name) + "." + quote_ident(table_name) + " "
+          "WHERE (" + item.rowkey_predicate + ") "
+          "AND " + quote_ident(req_col) + " = " + std::to_string(item.request_id);
+      std::vector<QueryRow> eval_rows;
+      int eval_ret = proxy_exec_read(eval_sql, 1, eval_rows);
+      if (OB_FAIL(eval_ret)) {
+        group_failed = true;
+      } else if (eval_rows.empty()) {
+        group_stale = true;
+        break;
+      } else if (eval_rows[0].is_nulls[0] || eval_rows[0].str_vals[0].empty()) {
+        group_failed = true;
+      } else {
+        computed_cols.push_back(std::make_pair(meta, eval_rows[0].str_vals[0]));
+      }
+
+      if (group_failed) {
+        std::string state_col = "__ai_col_state_" + meta.column_name;
+        if (item.retry_count < meta.max_retries) {
+          std::string upd_task_sql =
+              "UPDATE oceanbase.__all_ai_column_task "
+              "SET state = 3, retry_count = retry_count + 1, "
+              "eligible_ts = DATE_ADD(NOW(6), INTERVAL 600000 MICROSECOND) "
+              "WHERE table_id = " + std::to_string(item.table_id) + " "
+              "AND column_id = " + std::to_string(item.column_id) + " "
+              "AND rowkey_predicate = '" + sql_escape(item.rowkey_predicate) + "' "
+              "AND request_id = " + std::to_string(item.request_id);
+          (void)proxy_exec_write(upd_task_sql);
+          std::string upd_row_sql =
+              "UPDATE " + quote_ident(db_name) + "." + quote_ident(table_name) + " "
+              "SET " + quote_ident(state_col) + " = 'RETRY' "
+              "WHERE (" + item.rowkey_predicate + ") "
+              "AND " + quote_ident(req_col) + " = " + std::to_string(item.request_id);
+          (void)proxy_exec_write(upd_row_sql);
+        } else {
+          std::string upd_row_sql =
+              "UPDATE " + quote_ident(db_name) + "." + quote_ident(table_name) + " "
+              "SET " + quote_ident(state_col) + " = 'FAILED' "
+              "WHERE (" + item.rowkey_predicate + ") "
+              "AND " + quote_ident(req_col) + " = " + std::to_string(item.request_id);
+          (void)proxy_exec_write(upd_row_sql);
+          std::string del_task_sql =
+              "DELETE FROM oceanbase.__all_ai_column_task "
+              "WHERE table_id = " + std::to_string(item.table_id) + " "
+              "AND column_id = " + std::to_string(item.column_id) + " "
+              "AND rowkey_predicate = '" + sql_escape(item.rowkey_predicate) + "' "
+              "AND request_id = " + std::to_string(item.request_id);
+          (void)proxy_exec_write(del_task_sql);
+        }
+        break;
+      }
+    }
+
+    if (group_stale) {
+      std::string del_stale_sql =
+          "DELETE FROM oceanbase.__all_ai_column_task "
+          "WHERE table_id = " + std::to_string(grp.table_id) + " "
+          "AND rowkey_predicate = '" + sql_escape(grp.rowkey_predicate) + "' "
+          "AND request_id = " + std::to_string(grp.request_id);
+      (void)proxy_exec_write(del_stale_sql);
+    } else if (!group_failed && !computed_cols.empty()) {
+      std::string set_clause;
+      std::string req_guard_clause;
+      for (size_t ci = 0; ci < computed_cols.size(); ++ci) {
+        const AiColumnMeta &meta = computed_cols[ci].first;
+        const std::string &val = computed_cols[ci].second;
+        std::string state_col = "__ai_col_state_" + meta.column_name;
+        std::string req_col = "__ai_col_req_" + meta.column_name;
+        if (ci > 0) {
+          set_clause += ", ";
+        }
+        if (is_integer_col_type(meta.col_type)) {
+          set_clause += quote_ident(meta.column_name) + " = CAST('" + sql_escape(trim_ws(val)) + "' AS SIGNED)";
+        } else if (is_json_col_type(meta.col_type)) {
+          set_clause += quote_ident(meta.column_name) + " = CAST('" + sql_escape(val) + "' AS JSON)";
+        } else {
+          set_clause += quote_ident(meta.column_name) + " = '" + sql_escape(val) + "'";
+        }
+        set_clause += ", " + quote_ident(state_col) + " = 'READY'";
+        req_guard_clause += " AND " + quote_ident(req_col) + " = " + std::to_string(grp.request_id);
+      }
+      std::string upd_sql =
+          "UPDATE " + quote_ident(db_name) + "." + quote_ident(table_name) + " "
+          "SET " + set_clause + " "
+          "WHERE (" + grp.rowkey_predicate + ")" + req_guard_clause;
+      (void)proxy_exec_write(upd_sql);
+
+      std::string del_sql =
+          "DELETE FROM oceanbase.__all_ai_column_task "
+          "WHERE table_id = " + std::to_string(grp.table_id) + " "
+          "AND rowkey_predicate = '" + sql_escape(grp.rowkey_predicate) + "' "
+          "AND request_id = " + std::to_string(grp.request_id);
+      (void)proxy_exec_write(del_sql);
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(g_in_flight_mu);
+      g_in_flight_groups.erase(grp.group_key);
+    }
+    break;
+  }
+}
+
+static void ai_worker_loop()
+{
+  while (true) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    if (OB_ISNULL(GCTX.sql_proxy_) || !GCTX.sql_proxy_->is_inited()) {
+      continue;
+    }
+    SERVER_MODULE_SCOPE {
+      lib::ContextParam param;
+      param.set_mem_attr("AIColWorker", ObCtxIds::DEFAULT_CTX_ID)
+        .set_properties(lib::USE_TL_PAGE_OPTIONAL)
+        .set_page_size(OB_MALLOC_BIG_BLOCK_SIZE);
+      CREATE_WITH_TEMP_CONTEXT(param) {
+        THIS_WORKER.set_timeout_ts(ObTimeUtility::current_time() + 60LL * 1000000LL);
+        ai_worker_process_once();
+      }
+    }
+  }
+}
+
+static void ensure_ai_worker_started()
+{
+  if (OB_NOT_NULL(GCTX.sql_proxy_) && GCTX.sql_proxy_->is_inited()) {
+    std::call_once(g_ai_worker_once, []() {
+      std::thread(ai_worker_loop).detach();
+      std::thread(ai_worker_loop).detach();
+    });
+  }
+}
+
+static std::vector<std::string> split_top_level_comma(const std::string &s)
+{
+  std::vector<std::string> items;
+  int depth = 0;
+  char quote = 0;
+  size_t start = 0;
+  for (size_t i = 0; i < s.size(); ++i) {
+    char c = s[i];
+    if (quote != 0) {
+      if (c == '\\' && quote != '`' && i + 1 < s.size()) {
+        ++i;
+      } else if (c == quote) {
+        if (i + 1 < s.size() && s[i + 1] == quote) {
+          ++i;
+        } else {
+          quote = 0;
+        }
+      }
+    } else {
+      if (c == '\'' || c == '"' || c == '`') {
+        quote = c;
+      } else if (c == '(') {
+        ++depth;
+      } else if (c == ')') {
+        if (depth > 0) {
+          --depth;
+        }
+      } else if (c == ',' && depth == 0) {
+        items.push_back(trim_ws(s.substr(start, i - start)));
+        start = i + 1;
+      }
+    }
+  }
+  std::string tail = trim_ws(s.substr(start));
+  if (!tail.empty()) {
+    items.push_back(tail);
+  }
+  return items;
+}
+
+static bool find_matching_paren(const std::string &s, size_t open_pos, size_t &close_pos)
+{
+  if (open_pos >= s.size() || s[open_pos] != '(') {
+    return false;
+  }
+  int depth = 0;
+  char quote = 0;
+  for (size_t i = open_pos; i < s.size(); ++i) {
+    char c = s[i];
+    if (quote != 0) {
+      if (c == '\\' && quote != '`' && i + 1 < s.size()) {
+        ++i;
+      } else if (c == quote) {
+        if (i + 1 < s.size() && s[i + 1] == quote) {
+          ++i;
+        } else {
+          quote = 0;
+        }
+      }
+    } else {
+      if (c == '\'' || c == '"' || c == '`') {
+        quote = c;
+      } else if (c == '(') {
+        ++depth;
+      } else if (c == ')') {
+        --depth;
+        if (depth == 0) {
+          close_pos = i;
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+static size_t find_top_level_keyword_pair(const std::string &s,
+                                          const std::string &kw1_low,
+                                          const std::string &kw2_low,
+                                          size_t *after_kw2_pos = NULL)
+{
+  int depth = 0;
+  char quote = 0;
+  for (size_t i = 0; i < s.size(); ++i) {
+    char c = s[i];
+    if (quote != 0) {
+      if (c == '\\' && quote != '`' && i + 1 < s.size()) {
+        ++i;
+      } else if (c == quote) {
+        if (i + 1 < s.size() && s[i + 1] == quote) {
+          ++i;
+        } else {
+          quote = 0;
+        }
+      }
+      continue;
+    }
+    if (c == '\'' || c == '"' || c == '`') {
+      quote = c;
+      continue;
+    }
+    if (c == '(') {
+      ++depth;
+      continue;
+    }
+    if (c == ')') {
+      if (depth > 0) {
+        --depth;
+      }
+      continue;
+    }
+    if (depth == 0 && (std::isalpha(static_cast<unsigned char>(c)) || c == '_')) {
+      size_t w1_start = i;
+      while (i < s.size() && is_ident_char(s[i])) {
+        ++i;
+      }
+      std::string w1 = str_tolower(s.substr(w1_start, i - w1_start));
+      if (w1 == kw1_low) {
+        size_t j = i;
+        while (j < s.size() && std::isspace(static_cast<unsigned char>(s[j]))) {
+          ++j;
+        }
+        size_t w2_start = j;
+        while (j < s.size() && is_ident_char(s[j])) {
+          ++j;
+        }
+        std::string w2 = str_tolower(s.substr(w2_start, j - w2_start));
+        if (w2 == kw2_low) {
+          if (NULL != after_kw2_pos) {
+            *after_kw2_pos = j;
+          }
+          return w1_start;
+        }
+      }
+      --i;
+    }
+  }
+  return std::string::npos;
+}
+
+static size_t find_top_level_keyword(const std::string &s,
+                                     const std::string &kw_low,
+                                     size_t start_from = 0,
+                                     size_t *after_kw_pos = NULL)
+{
+  int depth = 0;
+  char quote = 0;
+  for (size_t i = start_from; i < s.size(); ++i) {
+    char c = s[i];
+    if (quote != 0) {
+      if (c == '\\' && quote != '`' && i + 1 < s.size()) {
+        ++i;
+      } else if (c == quote) {
+        if (i + 1 < s.size() && s[i + 1] == quote) {
+          ++i;
+        } else {
+          quote = 0;
+        }
+      }
+      continue;
+    }
+    if (c == '\'' || c == '"' || c == '`') {
+      quote = c;
+      continue;
+    }
+    if (c == '(') {
+      ++depth;
+      continue;
+    }
+    if (c == ')') {
+      if (depth > 0) {
+        --depth;
+      }
+      continue;
+    }
+    if (depth == 0 && (std::isalpha(static_cast<unsigned char>(c)) || c == '_')) {
+      size_t w_start = i;
+      while (i < s.size() && is_ident_char(s[i])) {
+        ++i;
+      }
+      std::string w = str_tolower(s.substr(w_start, i - w_start));
+      if (w == kw_low) {
+        if (NULL != after_kw_pos) {
+          *after_kw_pos = i;
+        }
+        return w_start;
+      }
+      --i;
+    }
+  }
+  return std::string::npos;
+}
+
+static void extract_referenced_columns(const std::string &expr,
+                                       std::vector<std::string> &cols_out)
+{
+  cols_out.clear();
+  std::set<std::string> seen;
+  for (size_t i = 0; i < expr.size(); ++i) {
+    char c = expr[i];
+    if (c == '\'' || c == '"') {
+      char q = c;
+      ++i;
+      while (i < expr.size()) {
+        if (expr[i] == '\\' && i + 1 < expr.size()) {
+          i += 2;
+        } else if (expr[i] == q) {
+          if (i + 1 < expr.size() && expr[i + 1] == q) {
+            i += 2;
+          } else {
+            break;
+          }
+        } else {
+          ++i;
+        }
+      }
+    } else if (c == '`') {
+      size_t start = i + 1;
+      ++i;
+      while (i < expr.size() && expr[i] != '`') {
+        ++i;
+      }
+      std::string ident = expr.substr(start, i - start);
+      std::string low = str_tolower(ident);
+      if (!ident.empty() && seen.find(low) == seen.end()) {
+        seen.insert(low);
+        cols_out.push_back(ident);
+      }
+    } else if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
+      size_t start = i;
+      while (i < expr.size() && is_ident_char(expr[i])) {
+        ++i;
+      }
+      std::string ident = expr.substr(start, i - start);
+      std::string low = str_tolower(ident);
+      size_t next_non_ws = i;
+      while (next_non_ws < expr.size() && std::isspace(static_cast<unsigned char>(expr[next_non_ws]))) {
+        ++next_non_ws;
+      }
+      bool is_func_call = (next_non_ws < expr.size() && expr[next_non_ws] == '(');
+      bool is_keyword = (low == "null" || low == "and" || low == "or" || low == "not"
+                         || low == "as" || low == "true" || low == "false"
+                         || low == "char" || low == "signed" || low == "unsigned"
+                         || low == "json" || low == "case" || low == "when"
+                         || low == "then" || low == "else" || low == "end");
+      if (!is_func_call && !is_keyword && seen.find(low) == seen.end()) {
+        seen.insert(low);
+        cols_out.push_back(ident);
+      }
+      --i;
+    }
+  }
+}
+
+struct ParsedAiColumnDef
+{
+  std::string column_name;
+  std::string col_type;
+  std::string ai_func_name;
+  std::string model_name;
+  std::string arg_expr;
+  std::string normalized_expr;
+  std::string sync_mode = "async";
+  int32_t max_retries = 3;
+  std::vector<std::string> dep_columns;
+};
+
+static int parse_ai_column_def(const std::string &col_def_str,
+                               const std::set<std::string> &regular_cols_low,
+                               const std::set<std::string> &ai_cols_low,
+                               ParsedAiColumnDef &out_def)
+{
+  int ret = OB_SUCCESS;
+  size_t after_ai_col = 0;
+  size_t ai_col_pos = find_top_level_keyword_pair(col_def_str, "ai", "column", &after_ai_col);
+  if (ai_col_pos == std::string::npos) {
+    return OB_INVALID_ARGUMENT;
+  }
+  std::string prefix = trim_ws(col_def_str.substr(0, ai_col_pos));
+  size_t idx = 0;
+  std::string col_name;
+  if (!prefix.empty() && prefix[0] == '`') {
+    size_t end_bt = prefix.find('`', 1);
+    if (end_bt == std::string::npos) {
+      return OB_INVALID_ARGUMENT;
+    }
+    col_name = prefix.substr(1, end_bt - 1);
+    idx = end_bt + 1;
+  } else {
+    while (idx < prefix.size() && !std::isspace(static_cast<unsigned char>(prefix[idx]))) {
+      ++idx;
+    }
+    col_name = prefix.substr(0, idx);
+  }
+  std::string col_type = trim_ws(prefix.substr(idx));
+  if (col_name.empty() || col_type.empty()) {
+    return OB_INVALID_ARGUMENT;
+  }
+  out_def.column_name = col_name;
+  out_def.col_type = col_type;
+
+  size_t expr_open = after_ai_col;
+  while (expr_open < col_def_str.size() && std::isspace(static_cast<unsigned char>(col_def_str[expr_open]))) {
+    ++expr_open;
+  }
+  size_t expr_close = 0;
+  if (!find_matching_paren(col_def_str, expr_open, expr_close)) {
+    return OB_INVALID_ARGUMENT;
+  }
+  std::string inner_expr = trim_ws(col_def_str.substr(expr_open + 1, expr_close - expr_open - 1));
+
+  size_t fn_open = inner_expr.find('(');
+  size_t fn_close = 0;
+  if (fn_open == std::string::npos || !find_matching_paren(inner_expr, fn_open, fn_close)) {
+    return OB_NOT_SUPPORTED;
+  }
+  std::string fn_name = str_tolower(trim_ws(inner_expr.substr(0, fn_open)));
+  if (fn_name != "ai_complete" && fn_name != "ai_embed") {
+    return OB_NOT_SUPPORTED;
+  }
+  out_def.ai_func_name = (fn_name == "ai_complete") ? "AI_COMPLETE" : "AI_EMBED";
+
+  std::string fn_args_str = inner_expr.substr(fn_open + 1, fn_close - fn_open - 1);
+  std::vector<std::string> fn_args = split_top_level_comma(fn_args_str);
+  if (fn_args.size() < 2) {
+    return OB_INVALID_ARGUMENT;
+  }
+  out_def.model_name = unquote_ident(fn_args[0]);
+  out_def.arg_expr = fn_args[1];
+
+  int64_t col_vec_dim = -1;
+  bool is_vec_col = is_vector_col_type(col_type, col_vec_dim);
+  if (fn_name == "ai_embed" && fn_args.size() >= 3) {
+    int64_t arg_dim = std::strtoll(trim_ws(fn_args[2]).c_str(), NULL, 10);
+    if (is_vec_col && col_vec_dim > 0 && arg_dim > 0 && col_vec_dim != arg_dim) {
+      ret = OB_ERR_INVALID_VECTOR_DIM;
+      LOG_USER_ERROR(OB_ERR_INVALID_VECTOR_DIM,
+                     static_cast<uint32_t>(col_vec_dim),
+                     static_cast<uint32_t>(arg_dim));
+      return ret;
+    }
+  }
+
+  std::vector<std::string> ref_cols;
+  extract_referenced_columns(out_def.arg_expr, ref_cols);
+  for (size_t i = 0; i < ref_cols.size(); ++i) {
+    std::string rlow = str_tolower(ref_cols[i]);
+    if (ai_cols_low.count(rlow) > 0 || rlow == str_tolower(col_name)) {
+      return OB_NOT_SUPPORTED;
+    }
+    if (!regular_cols_low.empty() && regular_cols_low.count(rlow) == 0) {
+      return OB_ERR_BAD_FIELD_ERROR;
+    }
+  }
+  out_def.dep_columns = ref_cols;
+
+  size_t after_with = 0;
+  size_t with_pos = find_top_level_keyword(col_def_str, "with", expr_close + 1, &after_with);
+  if (with_pos != std::string::npos) {
+    size_t w_open = after_with;
+    while (w_open < col_def_str.size() && std::isspace(static_cast<unsigned char>(col_def_str[w_open]))) {
+      ++w_open;
+    }
+    size_t w_close = 0;
+    if (!find_matching_paren(col_def_str, w_open, w_close)) {
+      return OB_INVALID_ARGUMENT;
+    }
+    std::vector<std::string> kv_items = split_top_level_comma(col_def_str.substr(w_open + 1, w_close - w_open - 1));
+    for (size_t i = 0; i < kv_items.size(); ++i) {
+      size_t eq = kv_items[i].find('=');
+      if (eq == std::string::npos) {
+        return OB_INVALID_ARGUMENT;
+      }
+      std::string k = str_tolower(trim_ws(kv_items[i].substr(0, eq)));
+      std::string v = unquote_ident(kv_items[i].substr(eq + 1));
+      if (k == "sync_mode") {
+        out_def.sync_mode = str_tolower(v);
+        if (out_def.sync_mode != "async") {
+          return OB_NOT_SUPPORTED;
+        }
+      } else if (k == "max_retries") {
+        out_def.max_retries = static_cast<int32_t>(std::strtol(v.c_str(), NULL, 10));
+        if (out_def.max_retries < 0) {
+          return OB_INVALID_ARGUMENT;
+        }
+      }
+    }
+  }
+
+  if (out_def.ai_func_name == "AI_COMPLETE") {
+    if (is_json_col_type(col_type)) {
+      out_def.normalized_expr = "AI_COMPLETE('" + sql_escape(out_def.model_name) + "', " + out_def.arg_expr
+          + ", '{\"system_prompt\":\"Return exactly one valid JSON value.\"}')";
+    } else if (is_integer_col_type(col_type)) {
+      out_def.normalized_expr = "AI_COMPLETE('" + sql_escape(out_def.model_name) + "', " + out_def.arg_expr
+          + ", '{\"system_prompt\":\"Return a base-10 integer.\"}')";
+    } else {
+      out_def.normalized_expr = "AI_COMPLETE('" + sql_escape(out_def.model_name) + "', " + out_def.arg_expr + ")";
+    }
+  } else {
+    out_def.normalized_expr = "AI_EMBED('" + sql_escape(out_def.model_name) + "', " + out_def.arg_expr + ")";
+  }
+  return OB_SUCCESS;
+}
+
+static int persist_ai_column_metadata(const std::string &db_name,
+                                      const std::string &table_name,
+                                      const std::vector<ParsedAiColumnDef> &ai_defs)
+{
+  int ret = ensure_metadata_tables_exist();
+  if (OB_FAIL(ret)) {
+    return ret;
+  }
+  std::string tbl_sql =
+      "SELECT t.table_id FROM oceanbase.__all_table t "
+      "JOIN oceanbase.__all_database d ON d.database_id = t.database_id "
+      "WHERE d.database_name = '" + sql_escape(db_name) + "' "
+      "AND t.table_name = '" + sql_escape(table_name) + "'";
+  std::vector<QueryRow> tbl_rows;
+  if (OB_FAIL(proxy_exec_read(tbl_sql, 1, tbl_rows)) || tbl_rows.empty()) {
+    return OB_ERR_UNEXPECTED;
+  }
+  uint64_t table_id = static_cast<uint64_t>(std::strtoull(tbl_rows[0].str_vals[0].c_str(), NULL, 10));
+
+  std::string col_sql =
+      "SELECT column_name, column_id FROM oceanbase.__all_column "
+      "WHERE table_id = " + std::to_string(table_id);
+  std::vector<QueryRow> col_rows;
+  if (OB_FAIL(proxy_exec_read(col_sql, 2, col_rows))) {
+    return ret;
+  }
+  std::map<std::string, uint64_t> col_id_map;
+  for (size_t i = 0; i < col_rows.size(); ++i) {
+    col_id_map[str_tolower(col_rows[i].str_vals[0])] =
+        static_cast<uint64_t>(std::strtoull(col_rows[i].str_vals[1].c_str(), NULL, 10));
+  }
+
+  for (size_t i = 0; i < ai_defs.size(); ++i) {
+    const ParsedAiColumnDef &d = ai_defs[i];
+    uint64_t col_id = col_id_map[str_tolower(d.column_name)];
+    uint64_t state_id = col_id_map[str_tolower("__ai_col_state_" + d.column_name)];
+    uint64_t req_id = col_id_map[str_tolower("__ai_col_req_" + d.column_name)];
+    uint64_t spec_id = col_id_map[str_tolower("__ai_col_spec_" + d.column_name)];
+    std::string dep_csv;
+    for (size_t j = 0; j < d.dep_columns.size(); ++j) {
+      if (j > 0) {
+        dep_csv += ",";
+      }
+      dep_csv += d.dep_columns[j];
+    }
+    std::string ins_sql =
+        "REPLACE INTO oceanbase.__all_ai_column "
+        "(table_id, column_id, column_name, state_column_id, request_column_id, result_spec_column_id, "
+        "sync_mode, max_retries, normalized_expr, ai_func_name, model_name, arg_expr, col_type, dep_columns) "
+        "VALUES (" + std::to_string(table_id) + ", " + std::to_string(col_id) + ", '"
+        + sql_escape(d.column_name) + "', " + std::to_string(state_id) + ", "
+        + std::to_string(req_id) + ", " + std::to_string(spec_id) + ", '"
+        + sql_escape(d.sync_mode) + "', " + std::to_string(d.max_retries) + ", '"
+        + sql_escape(d.normalized_expr) + "', '" + sql_escape(d.ai_func_name) + "', '"
+        + sql_escape(d.model_name) + "', '" + sql_escape(d.arg_expr) + "', '"
+        + sql_escape(d.col_type) + "', '" + sql_escape(dep_csv) + "')";
+    if (OB_FAIL(proxy_exec_write(ins_sql))) {
+      return ret;
+    }
+  }
+  return OB_SUCCESS;
+}
+
+static bool is_table_constraint_item(const std::string &item)
+{
+  size_t i = 0;
+  while (i < item.size() && std::isspace(static_cast<unsigned char>(item[i]))) {
+    ++i;
+  }
+  size_t start = i;
+  while (i < item.size() && is_ident_char(item[i])) {
+    ++i;
+  }
+  std::string w1 = str_tolower(item.substr(start, i - start));
+  if (w1 == "primary" || w1 == "unique" || w1 == "key" || w1 == "index"
+      || w1 == "constraint" || w1 == "foreign" || w1 == "check" || w1 == "fulltext" || w1 == "vector") {
+    return true;
+  }
+  return false;
+}
+
+static int handle_create_table_ai_column(ObSql *sql_engine,
+                                         query::ObIPlanCacheAccessService *pc_service,
+                                         ObSQLSessionInfo &session,
+                                         ObSqlCtx &context,
+                                         const std::string &raw_sql,
+                                         const std::string &default_db,
+                                         bool &handled)
+{
+  handled = false;
+  if (find_top_level_keyword_pair(raw_sql, "create", "table") != 0
+      || raw_sql.find("AI COLUMN") == std::string::npos && str_tolower(raw_sql).find("ai column") == std::string::npos) {
+    return OB_SUCCESS;
+  }
+  size_t open_paren = raw_sql.find('(');
+  size_t close_paren = 0;
+  if (open_paren == std::string::npos || !find_matching_paren(raw_sql, open_paren, close_paren)) {
+    return OB_SUCCESS;
+  }
+
+  size_t after_create_table = 0;
+  find_top_level_keyword_pair(raw_sql, "create", "table", &after_create_table);
+  std::string tbl_part = trim_ws(raw_sql.substr(after_create_table, open_paren - after_create_table));
+  size_t after_if_not_exists = 0;
+  if (find_top_level_keyword_pair(tbl_part, "if", "not") == 0) {
+    size_t after_exists = 0;
+    if (find_top_level_keyword(tbl_part, "exists", 0, &after_exists) != std::string::npos) {
+      tbl_part = trim_ws(tbl_part.substr(after_exists));
+    }
+  }
+  std::string db_name, table_name;
+  split_qualified_table_name(tbl_part, default_db, db_name, table_name);
+
+  std::string body = raw_sql.substr(open_paren + 1, close_paren - open_paren - 1);
+  std::vector<std::string> items = split_top_level_comma(body);
+  std::set<std::string> regular_cols_low;
+  std::set<std::string> ai_cols_low;
+
+  for (size_t i = 0; i < items.size(); ++i) {
+    if (is_table_constraint_item(items[i])) {
+      continue;
+    }
+    if (find_top_level_keyword_pair(items[i], "ai", "column") != std::string::npos) {
+      size_t idx = 0;
+      std::string cname;
+      if (items[i][0] == '`') {
+        size_t e = items[i].find('`', 1);
+        if (e != std::string::npos) cname = items[i].substr(1, e - 1);
+      } else {
+        while (idx < items[i].size() && !std::isspace(static_cast<unsigned char>(items[i][idx]))) ++idx;
+        cname = items[i].substr(0, idx);
+      }
+      ai_cols_low.insert(str_tolower(cname));
+    } else {
+      size_t idx = 0;
+      std::string cname;
+      if (items[i][0] == '`') {
+        size_t e = items[i].find('`', 1);
+        if (e != std::string::npos) cname = items[i].substr(1, e - 1);
+      } else {
+        while (idx < items[i].size() && !std::isspace(static_cast<unsigned char>(items[i][idx]))) ++idx;
+        cname = items[i].substr(0, idx);
+      }
+      regular_cols_low.insert(str_tolower(cname));
+    }
+  }
+
+  if (ai_cols_low.empty()) {
+    return OB_SUCCESS;
+  }
+  handled = true;
+
+  std::vector<ParsedAiColumnDef> ai_defs;
+  std::string new_body;
+  for (size_t i = 0; i < items.size(); ++i) {
+    if (!new_body.empty()) {
+      new_body += ", ";
+    }
+    if (!is_table_constraint_item(items[i])
+        && find_top_level_keyword_pair(items[i], "ai", "column") != std::string::npos) {
+      ParsedAiColumnDef def;
+      int ret = parse_ai_column_def(items[i], regular_cols_low, ai_cols_low, def);
+      if (OB_FAIL(ret)) {
+        return ret;
+      }
+      ai_defs.push_back(def);
+      new_body += quote_ident(def.column_name) + " " + def.col_type
+          + ", " + quote_ident("__ai_col_state_" + def.column_name) + " varchar(32)"
+          + ", " + quote_ident("__ai_col_req_" + def.column_name) + " bigint"
+          + ", " + quote_ident("__ai_col_spec_" + def.column_name) + " varchar(256)";
+    } else {
+      new_body += items[i];
+    }
+  }
+
+  std::string rewritten_create = raw_sql.substr(0, open_paren + 1) + new_body + raw_sql.substr(close_paren);
+  int ret = exec_session_sql(sql_engine, pc_service, session, context, rewritten_create, NULL, true);
+  if (OB_SUCC(ret)) {
+    ret = persist_ai_column_metadata(db_name, table_name, ai_defs);
+  }
+  return ret;
+}
+
+static std::string rewrite_retry_where_status(const std::string &pred, const std::string &state_col)
+{
+  std::string out;
+  char quote = 0;
+  for (size_t i = 0; i < pred.size(); ++i) {
+    char c = pred[i];
+    if (quote != 0) {
+      out.push_back(c);
+      if (c == '\\' && quote != '`' && i + 1 < pred.size()) {
+        out.push_back(pred[++i]);
+      } else if (c == quote) {
+        if (i + 1 < pred.size() && pred[i + 1] == quote) {
+          out.push_back(pred[++i]);
+        } else {
+          quote = 0;
+        }
+      }
+      continue;
+    }
+    if (c == '\'' || c == '"' || c == '`') {
+      quote = c;
+      out.push_back(c);
+      continue;
+    }
+    if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
+      bool preceded_by_dot = (!out.empty() && out.back() == '.');
+      size_t start = i;
+      while (i < pred.size() && is_ident_char(pred[i])) {
+        ++i;
+      }
+      std::string word = pred.substr(start, i - start);
+      if (!preceded_by_dot && str_tolower(word) == "status") {
+        out += quote_ident(state_col);
+      } else {
+        out += word;
+      }
+      --i;
+    } else {
+      out.push_back(c);
+    }
+  }
+  return out;
+}
+
+static int handle_alter_table_ai_column(ObSql *sql_engine,
+                                        query::ObIPlanCacheAccessService *pc_service,
+                                        ObSQLSessionInfo &session,
+                                        ObSqlCtx &context,
+                                        const std::string &raw_sql,
+                                        const std::string &default_db,
+                                        bool &handled)
+{
+  handled = false;
+  size_t after_alter_table = 0;
+  if (find_top_level_keyword_pair(raw_sql, "alter", "table", &after_alter_table) != 0) {
+    return OB_SUCCESS;
+  }
+  std::string clean_sql = strip_trailing_semicolon(raw_sql);
+  size_t i = after_alter_table;
+  while (i < clean_sql.size() && std::isspace(static_cast<unsigned char>(clean_sql[i]))) {
+    ++i;
+  }
+  size_t tbl_start = i;
+  bool in_bt = false;
+  while (i < clean_sql.size()) {
+    if (clean_sql[i] == '`') {
+      in_bt = !in_bt;
+      ++i;
+    } else if (!in_bt && std::isspace(static_cast<unsigned char>(clean_sql[i]))) {
+      break;
+    } else {
+      ++i;
+    }
+  }
+  std::string db_name, table_name;
+  split_qualified_table_name(clean_sql.substr(tbl_start, i - tbl_start), default_db, db_name, table_name);
+  std::string rest = trim_ws(clean_sql.substr(i));
+
+  // Case A: ALTER TABLE ... RETRY AI COLUMN <col> [WHERE <pred>]
+  size_t after_retry = 0;
+  if (find_top_level_keyword(rest, "retry", 0, &after_retry) == 0) {
+    handled = true;
+    std::vector<std::string> actions = split_top_level_comma(rest);
+    if (actions.size() > 1) {
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "combining AI COLUMN RETRY with another ALTER action");
+      return OB_NOT_SUPPORTED;
+    }
+    size_t after_ai_col = 0;
+    if (find_top_level_keyword_pair(rest, "ai", "column", &after_ai_col) == std::string::npos) {
+      return OB_INVALID_ARGUMENT;
+    }
+    size_t col_start = after_ai_col;
+    while (col_start < rest.size() && std::isspace(static_cast<unsigned char>(rest[col_start]))) {
+      ++col_start;
+    }
+    size_t after_where = 0;
+    size_t where_pos = find_top_level_keyword(rest, "where", col_start, &after_where);
+    std::string col_name = unquote_ident(where_pos == std::string::npos
+                                         ? rest.substr(col_start)
+                                         : rest.substr(col_start, where_pos - col_start));
+    std::string where_pred = (where_pos == std::string::npos) ? "" : trim_ws(rest.substr(after_where));
+
+    std::vector<AiColumnMeta> ai_cols;
+    load_table_ai_columns(db_name, table_name, ai_cols);
+    const AiColumnMeta *target_meta = NULL;
+    for (size_t ci = 0; ci < ai_cols.size(); ++ci) {
+      if (str_tolower(ai_cols[ci].column_name) == str_tolower(col_name)) {
+        target_meta = &ai_cols[ci];
+        break;
+      }
+    }
+    if (NULL == target_meta) {
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+      return OB_NOT_SUPPORTED;
+    }
+
+    std::vector<std::string> pk_cols;
+    load_table_pk_columns(target_meta->table_id, pk_cols);
+    if (pk_cols.empty()) {
+      return OB_ERR_UNEXPECTED;
+    }
+    std::string state_col = "__ai_col_state_" + target_meta->column_name;
+    std::string req_col = "__ai_col_req_" + target_meta->column_name;
+    std::string rewritten_where = where_pred.empty() ? "1 = 1" : rewrite_retry_where_status(where_pred, state_col);
+
+    std::string sel_pks_sql =
+        "SELECT " + build_pk_select_list(pk_cols) + " FROM "
+        + quote_ident(db_name) + "." + quote_ident(table_name)
+        + " WHERE " + rewritten_where;
+    std::vector<QueryRow> pk_rows;
+    int ret = exec_session_sql(sql_engine, pc_service, session, context, sel_pks_sql, &pk_rows);
+    if (OB_FAIL(ret) || pk_rows.empty()) {
+      return ret;
+    }
+    for (size_t ri = 0; ri < pk_rows.size(); ++ri) {
+      std::string rpred = build_rowkey_predicate(pk_cols, pk_rows[ri]);
+      int64_t req_id = next_request_id();
+      std::string upd_sql =
+          "UPDATE " + quote_ident(db_name) + "." + quote_ident(table_name) + " SET "
+          + quote_ident(target_meta->column_name) + " = NULL, "
+          + quote_ident(state_col) + " = 'PENDING', "
+          + quote_ident(req_col) + " = " + std::to_string(req_id)
+          + " WHERE " + rpred;
+      if (OB_FAIL(ret = exec_session_sql(sql_engine, pc_service, session, context, upd_sql))) {
+        return ret;
+      }
+      std::string task_sql =
+          "REPLACE INTO oceanbase.__all_ai_column_task "
+          "(table_id, column_id, rowkey_predicate, request_id, state, retry_count, eligible_ts) VALUES ("
+          + std::to_string(target_meta->table_id) + ", "
+          + std::to_string(target_meta->column_id) + ", '"
+          + sql_escape(rpred) + "', " + std::to_string(req_id) + ", 1, 0, NOW(6))";
+      if (OB_FAIL(ret = exec_session_sql(sql_engine, pc_service, session, context, task_sql))) {
+        return ret;
+      }
+    }
+    return OB_SUCCESS;
+  }
+
+  // Case B: ALTER TABLE ... ADD [COLUMN] <col> <type> AI COLUMN (...)
+  if (find_top_level_keyword_pair(rest, "ai", "column") != std::string::npos) {
+    handled = true;
+    size_t after_add = 0;
+    if (find_top_level_keyword(rest, "add", 0, &after_add) != 0) {
+      return OB_NOT_SUPPORTED;
+    }
+    std::string col_def = trim_ws(rest.substr(after_add));
+    size_t after_col_kw = 0;
+    if (find_top_level_keyword(col_def, "column", 0, &after_col_kw) == 0) {
+      col_def = trim_ws(col_def.substr(after_col_kw));
+    }
+
+    std::vector<AiColumnMeta> existing_ai;
+    load_table_ai_columns(db_name, table_name, existing_ai);
+    std::set<std::string> ai_cols_low;
+    for (size_t ci = 0; ci < existing_ai.size(); ++ci) {
+      ai_cols_low.insert(str_tolower(existing_ai[ci].column_name));
+    }
+    std::set<std::string> regular_cols_low;
+    std::string col_sql =
+        "SELECT c.column_name FROM oceanbase.__all_column c "
+        "JOIN oceanbase.__all_table t ON t.table_id = c.table_id "
+        "JOIN oceanbase.__all_database d ON d.database_id = t.database_id "
+        "WHERE d.database_name = '" + sql_escape(db_name) + "' "
+        "AND t.table_name = '" + sql_escape(table_name) + "' AND c.is_hidden = 0";
+    std::vector<QueryRow> col_rows;
+    if (OB_SUCC(proxy_exec_read(col_sql, 1, col_rows))) {
+      for (size_t ci = 0; ci < col_rows.size(); ++ci) {
+        std::string clow = str_tolower(col_rows[ci].str_vals[0]);
+        if (ai_cols_low.count(clow) == 0) {
+          regular_cols_low.insert(clow);
+        }
+      }
+    }
+
+    ParsedAiColumnDef def;
+    int ret = parse_ai_column_def(col_def, regular_cols_low, ai_cols_low, def);
+    if (OB_FAIL(ret)) {
+      return ret;
+    }
+    std::string rewritten_alter =
+        "ALTER TABLE " + quote_ident(db_name) + "." + quote_ident(table_name)
+        + " ADD COLUMN " + quote_ident(def.column_name) + " " + def.col_type
+        + ", ADD COLUMN " + quote_ident("__ai_col_state_" + def.column_name) + " varchar(32)"
+        + ", ADD COLUMN " + quote_ident("__ai_col_req_" + def.column_name) + " bigint"
+        + ", ADD COLUMN " + quote_ident("__ai_col_spec_" + def.column_name) + " varchar(256)";
+    if (OB_FAIL(ret = exec_session_sql(sql_engine, pc_service, session, context, rewritten_alter, NULL, true))) {
+      return ret;
+    }
+    std::vector<ParsedAiColumnDef> defs{def};
+    return persist_ai_column_metadata(db_name, table_name, defs);
+  }
+
+  return OB_SUCCESS;
+}
+
+static int handle_drop_table_ai_column(const std::string &raw_sql,
+                                       const std::string &default_db)
+{
+  if (!g_ai_meta_tables_ready.load(std::memory_order_acquire)) {
+    return OB_SUCCESS;
+  }
+  size_t after_drop_db = 0;
+  if (find_top_level_keyword_pair(raw_sql, "drop", "database", &after_drop_db) == 0) {
+    std::string rest = trim_ws(strip_trailing_semicolon(raw_sql).substr(after_drop_db));
+    size_t after_exists = 0;
+    if (find_top_level_keyword_pair(rest, "if", "exists", &after_exists) == 0) {
+      rest = trim_ws(rest.substr(after_exists));
+    }
+    std::string db_name = unquote_ident(rest);
+    std::vector<AiColumnMeta> all_cols;
+    load_all_ai_columns(all_cols);
+    for (size_t i = 0; i < all_cols.size(); ++i) {
+      if (str_tolower(all_cols[i].db_name) == str_tolower(db_name)) {
+        uint64_t tid = all_cols[i].table_id;
+        (void)proxy_exec_write("DELETE FROM oceanbase.__all_ai_column WHERE table_id = " + std::to_string(tid));
+        (void)proxy_exec_write("DELETE FROM oceanbase.__all_ai_column_task WHERE table_id = " + std::to_string(tid));
+      }
+    }
+    return OB_SUCCESS;
+  }
+  size_t after_drop_table = 0;
+  if (find_top_level_keyword_pair(raw_sql, "drop", "table", &after_drop_table) != 0) {
+    return OB_SUCCESS;
+  }
+  std::string rest = trim_ws(strip_trailing_semicolon(raw_sql).substr(after_drop_table));
+  size_t after_exists = 0;
+  if (find_top_level_keyword_pair(rest, "if", "exists", &after_exists) == 0) {
+    rest = trim_ws(rest.substr(after_exists));
+  }
+  std::vector<std::string> tbls = split_top_level_comma(rest);
+  for (size_t i = 0; i < tbls.size(); ++i) {
+    std::string db_name, table_name;
+    split_qualified_table_name(tbls[i], default_db, db_name, table_name);
+    std::vector<AiColumnMeta> cols;
+    load_table_ai_columns(db_name, table_name, cols);
+    if (!cols.empty()) {
+      uint64_t tid = cols[0].table_id;
+      (void)proxy_exec_write("DELETE FROM oceanbase.__all_ai_column WHERE table_id = " + std::to_string(tid));
+      (void)proxy_exec_write("DELETE FROM oceanbase.__all_ai_column_task WHERE table_id = " + std::to_string(tid));
+    }
+  }
+  return OB_SUCCESS;
+}
+
+static bool sql_references_identifier(const std::string &sql, const std::string &ident)
+{
+  std::string target_low = str_tolower(ident);
+  char quote = 0;
+  for (size_t i = 0; i < sql.size(); ++i) {
+    char c = sql[i];
+    if (quote != 0) {
+      if (c == '\\' && quote != '`' && i + 1 < sql.size()) {
+        ++i;
+      } else if (c == quote) {
+        if (i + 1 < sql.size() && sql[i + 1] == quote) {
+          ++i;
+        } else {
+          quote = 0;
+        }
+      }
+      continue;
+    }
+    if (c == '\'' || c == '"') {
+      quote = c;
+      continue;
+    }
+    if (c == '`') {
+      size_t start = i + 1;
+      ++i;
+      while (i < sql.size() && sql[i] != '`') {
+        ++i;
+      }
+      if (str_tolower(sql.substr(start, i - start)) == target_low) {
+        return true;
+      }
+      continue;
+    }
+    if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
+      size_t start = i;
+      while (i < sql.size() && is_ident_char(sql[i])) {
+        ++i;
+      }
+      if (str_tolower(sql.substr(start, i - start)) == target_low) {
+        return true;
+      }
+      --i;
+    }
+  }
+  return false;
+}
+
+static int check_strict_read_for_sql(ObSql *sql_engine,
+                                     query::ObIPlanCacheAccessService *pc_service,
+                                     ObSQLSessionInfo &session,
+                                     ObSqlCtx &context,
+                                     const std::string &raw_sql,
+                                     const std::string &default_db)
+{
+  int64_t strict_read = 0;
+  if (OB_FAIL(session.get_sys_variable(share::SYS_VAR_AI_COLUMN_STRICT_READ, strict_read)) || 0 == strict_read) {
+    return OB_SUCCESS;
+  }
+  if (!g_ai_meta_tables_ready.load(std::memory_order_acquire)) {
+    return OB_SUCCESS;
+  }
+  std::string low_sql = str_tolower(raw_sql);
+  if (low_sql.find("__all_ai_column") != std::string::npos) {
+    return OB_SUCCESS;
+  }
+  std::vector<AiColumnMeta> all_metas;
+  load_all_ai_columns(all_metas);
+  for (size_t i = 0; i < all_metas.size(); ++i) {
+    const AiColumnMeta &m = all_metas[i];
+    bool table_mentioned = sql_references_identifier(raw_sql, m.table_name)
+        && (str_tolower(m.db_name) == str_tolower(default_db)
+            || sql_references_identifier(raw_sql, m.db_name));
+    if (!table_mentioned) {
+      continue;
+    }
+    if (!sql_references_identifier(raw_sql, m.column_name)) {
+      continue;
+    }
+    std::string state_col = "__ai_col_state_" + m.column_name;
+    std::string chk_sql =
+        "SELECT COUNT(*) FROM " + quote_ident(m.db_name) + "." + quote_ident(m.table_name)
+        + " WHERE " + quote_ident(state_col) + " IS NULL OR " + quote_ident(state_col) + " != 'READY'";
+    std::vector<QueryRow> rows;
+    int ret = exec_session_sql(sql_engine, pc_service, session, context, chk_sql, &rows);
+    if (OB_SUCC(ret) && !rows.empty() && std::strtoll(rows[0].str_vals[0].c_str(), NULL, 10) > 0) {
+      LOG_USER_ERROR(OB_AI_COLUMN_UNFINISHED_TASKS, m.table_id, m.column_id);
+      return OB_AI_COLUMN_UNFINISHED_TASKS;
+    }
+  }
+  return OB_SUCCESS;
+}
+
+static int handle_dml_ai_column(ObSql *sql_engine,
+                                query::ObIPlanCacheAccessService *pc_service,
+                                ObSQLSessionInfo &session,
+                                ObSqlCtx &context,
+                                const std::string &raw_sql,
+                                const std::string &default_db,
+                                bool &handled)
+{
+  handled = false;
+  if (!g_ai_meta_tables_ready.load(std::memory_order_acquire)) {
+    return OB_SUCCESS;
+  }
+  std::string clean_sql = strip_trailing_semicolon(raw_sql);
+  size_t pos = 0;
+  while (pos < clean_sql.size() && std::isspace(static_cast<unsigned char>(clean_sql[pos]))) {
+    ++pos;
+  }
+  size_t w_start = pos;
+  while (pos < clean_sql.size() && is_ident_char(clean_sql[pos])) {
+    ++pos;
+  }
+  std::string first_kw = str_tolower(clean_sql.substr(w_start, pos - w_start));
+
+  if (first_kw == "select") {
+    return check_strict_read_for_sql(sql_engine, pc_service, session, context, clean_sql, default_db);
+  }
+
+  // Case 1: INSERT INTO <tbl> ...
+  if (first_kw == "insert") {
+    size_t after_into = 0;
+    if (find_top_level_keyword(clean_sql, "into", pos, &after_into) == std::string::npos) {
+      return OB_SUCCESS;
+    }
+    size_t i = after_into;
+    while (i < clean_sql.size() && std::isspace(static_cast<unsigned char>(clean_sql[i]))) {
+      ++i;
+    }
+    size_t tbl_start = i;
+    bool in_bt = false;
+    while (i < clean_sql.size()) {
+      if (clean_sql[i] == '`') {
+        in_bt = !in_bt;
+        ++i;
+      } else if (!in_bt && (std::isspace(static_cast<unsigned char>(clean_sql[i])) || clean_sql[i] == '(')) {
+        break;
+      } else {
+        ++i;
+      }
+    }
+    std::string db_name, table_name;
+    split_qualified_table_name(clean_sql.substr(tbl_start, i - tbl_start), default_db, db_name, table_name);
+    if (str_tolower(db_name) == "oceanbase") {
+      return OB_SUCCESS;
+    }
+    std::vector<AiColumnMeta> ai_cols;
+    load_table_ai_columns(db_name, table_name, ai_cols);
+    if (ai_cols.empty()) {
+      return OB_SUCCESS;
+    }
+    handled = true;
+    int ret = exec_session_sql(sql_engine, pc_service, session, context, clean_sql);
+    if (OB_FAIL(ret)) {
+      return ret;
+    }
+    std::vector<std::string> pk_cols;
+    load_table_pk_columns(ai_cols[0].table_id, pk_cols);
+    if (pk_cols.empty()) {
+      return OB_ERR_UNEXPECTED;
+    }
+    std::string first_state_col = "__ai_col_state_" + ai_cols[0].column_name;
+    std::string sel_new_sql =
+        "SELECT " + build_pk_select_list(pk_cols) + " FROM "
+        + quote_ident(db_name) + "." + quote_ident(table_name)
+        + " WHERE " + quote_ident(first_state_col) + " IS NULL";
+    std::vector<QueryRow> new_rows;
+    if (OB_FAIL(ret = exec_session_sql(sql_engine, pc_service, session, context, sel_new_sql, &new_rows))) {
+      return ret;
+    }
+    for (size_t ri = 0; ri < new_rows.size(); ++ri) {
+      std::string rpred = build_rowkey_predicate(pk_cols, new_rows[ri]);
+      int64_t req_id = next_request_id();
+      std::string set_clause;
+      for (size_t ci = 0; ci < ai_cols.size(); ++ci) {
+        if (ci > 0) {
+          set_clause += ", ";
+        }
+        const AiColumnMeta &m = ai_cols[ci];
+        set_clause += quote_ident(m.column_name) + " = NULL, "
+            + quote_ident("__ai_col_state_" + m.column_name) + " = 'PENDING', "
+            + quote_ident("__ai_col_req_" + m.column_name) + " = " + std::to_string(req_id) + ", "
+            + quote_ident("__ai_col_spec_" + m.column_name) + " = '" + sql_escape(m.col_type) + "'";
+      }
+      std::string upd_sql =
+          "UPDATE " + quote_ident(db_name) + "." + quote_ident(table_name)
+          + " SET " + set_clause + " WHERE " + rpred;
+      if (OB_FAIL(ret = exec_session_sql(sql_engine, pc_service, session, context, upd_sql))) {
+        return ret;
+      }
+      for (size_t ci = 0; ci < ai_cols.size(); ++ci) {
+        const AiColumnMeta &m = ai_cols[ci];
+        std::string task_sql =
+            "REPLACE INTO oceanbase.__all_ai_column_task "
+            "(table_id, column_id, rowkey_predicate, request_id, state, retry_count, eligible_ts) VALUES ("
+            + std::to_string(m.table_id) + ", " + std::to_string(m.column_id) + ", '"
+            + sql_escape(rpred) + "', " + std::to_string(req_id) + ", 1, 0, NOW(6))";
+        if (OB_FAIL(ret = exec_session_sql(sql_engine, pc_service, session, context, task_sql))) {
+          return ret;
+        }
+      }
+    }
+    return OB_SUCCESS;
+  }
+
+  // Case 2: UPDATE <tbl> SET ... [WHERE ...]
+  if (first_kw == "update") {
+    int ret = check_strict_read_for_sql(sql_engine, pc_service, session, context, clean_sql, default_db);
+    if (OB_FAIL(ret)) {
+      return ret;
+    }
+    size_t after_set = 0;
+    size_t set_pos = find_top_level_keyword(clean_sql, "set", pos, &after_set);
+    if (set_pos == std::string::npos) {
+      return OB_SUCCESS;
+    }
+    std::string tbl_raw = trim_ws(clean_sql.substr(pos, set_pos - pos));
+    std::string db_name, table_name;
+    split_qualified_table_name(tbl_raw, default_db, db_name, table_name);
+    if (str_tolower(db_name) == "oceanbase") {
+      return OB_SUCCESS;
+    }
+    std::vector<AiColumnMeta> ai_cols;
+    load_table_ai_columns(db_name, table_name, ai_cols);
+    if (ai_cols.empty()) {
+      return OB_SUCCESS;
+    }
+    size_t after_where = 0;
+    size_t where_pos = find_top_level_keyword(clean_sql, "where", after_set, &after_where);
+    std::string set_body = (where_pos == std::string::npos)
+        ? trim_ws(clean_sql.substr(after_set))
+        : trim_ws(clean_sql.substr(after_set, where_pos - after_set));
+    std::string where_clause = (where_pos == std::string::npos)
+        ? ""
+        : trim_ws(clean_sql.substr(after_where));
+
+    std::vector<std::string> assigns = split_top_level_comma(set_body);
+    std::set<std::string> updated_cols_low;
+    for (size_t ai = 0; ai < assigns.size(); ++ai) {
+      size_t eq = assigns[ai].find('=');
+      if (eq != std::string::npos) {
+        std::string lhs = unquote_ident(assigns[ai].substr(0, eq));
+        size_t dot = lhs.rfind('.');
+        if (dot != std::string::npos) {
+          lhs = unquote_ident(lhs.substr(dot + 1));
+        }
+        updated_cols_low.insert(str_tolower(lhs));
+      }
+    }
+
+    std::vector<std::string> pk_cols;
+    load_table_pk_columns(ai_cols[0].table_id, pk_cols);
+    bool pk_modified = false;
+    for (size_t pi = 0; pi < pk_cols.size(); ++pi) {
+      if (updated_cols_low.count(str_tolower(pk_cols[pi])) > 0) {
+        pk_modified = true;
+        break;
+      }
+    }
+
+    std::vector<AiColumnMeta> affected_ai;
+    for (size_t ci = 0; ci < ai_cols.size(); ++ci) {
+      bool dep_hit = pk_modified;
+      for (size_t di = 0; !dep_hit && di < ai_cols[ci].dep_columns.size(); ++di) {
+        if (updated_cols_low.count(str_tolower(ai_cols[ci].dep_columns[di])) > 0) {
+          dep_hit = true;
+        }
+      }
+      if (dep_hit) {
+        affected_ai.push_back(ai_cols[ci]);
+      }
+    }
+    if (affected_ai.empty()) {
+      return OB_SUCCESS;
+    }
+
+    handled = true;
+    if (pk_modified) {
+      std::string old_pk_sql =
+          "SELECT " + build_pk_select_list(pk_cols) + " FROM "
+          + quote_ident(db_name) + "." + quote_ident(table_name)
+          + (where_clause.empty() ? "" : (" WHERE " + where_clause));
+      std::vector<QueryRow> old_rows;
+      if (OB_FAIL(ret = exec_session_sql(sql_engine, pc_service, session, context, old_pk_sql, &old_rows))) {
+        return ret;
+      }
+      for (size_t ri = 0; ri < old_rows.size(); ++ri) {
+        std::string old_pred = build_rowkey_predicate(pk_cols, old_rows[ri]);
+        std::string del_old_sql =
+            "DELETE FROM oceanbase.__all_ai_column_task "
+            "WHERE table_id = " + std::to_string(ai_cols[0].table_id)
+            + " AND rowkey_predicate = '" + sql_escape(old_pred) + "'";
+        if (OB_FAIL(ret = exec_session_sql(sql_engine, pc_service, session, context, del_old_sql))) {
+          return ret;
+        }
+      }
+    }
+
+    int64_t req_id = next_request_id();
+    std::string extra_set;
+    for (size_t ci = 0; ci < affected_ai.size(); ++ci) {
+      const AiColumnMeta &m = affected_ai[ci];
+      extra_set += ", " + quote_ident(m.column_name) + " = NULL, "
+          + quote_ident("__ai_col_state_" + m.column_name) + " = 'PENDING', "
+          + quote_ident("__ai_col_req_" + m.column_name) + " = " + std::to_string(req_id) + ", "
+          + quote_ident("__ai_col_spec_" + m.column_name) + " = '" + sql_escape(m.col_type) + "'";
+    }
+    std::string rewritten_upd =
+        clean_sql.substr(0, after_set) + " " + set_body + extra_set
+        + (where_clause.empty() ? "" : (" WHERE " + where_clause));
+    if (OB_FAIL(ret = exec_session_sql(sql_engine, pc_service, session, context, rewritten_upd))) {
+      return ret;
+    }
+
+    std::string first_req_col = "__ai_col_req_" + affected_ai[0].column_name;
+    std::string new_pk_sql =
+        "SELECT " + build_pk_select_list(pk_cols) + " FROM "
+        + quote_ident(db_name) + "." + quote_ident(table_name)
+        + " WHERE " + quote_ident(first_req_col) + " = " + std::to_string(req_id);
+    std::vector<QueryRow> new_rows;
+    if (OB_FAIL(ret = exec_session_sql(sql_engine, pc_service, session, context, new_pk_sql, &new_rows))) {
+      return ret;
+    }
+    for (size_t ri = 0; ri < new_rows.size(); ++ri) {
+      std::string rpred = build_rowkey_predicate(pk_cols, new_rows[ri]);
+      for (size_t ci = 0; ci < affected_ai.size(); ++ci) {
+        const AiColumnMeta &m = affected_ai[ci];
+        std::string task_sql =
+            "REPLACE INTO oceanbase.__all_ai_column_task "
+            "(table_id, column_id, rowkey_predicate, request_id, state, retry_count, eligible_ts) VALUES ("
+            + std::to_string(m.table_id) + ", " + std::to_string(m.column_id) + ", '"
+            + sql_escape(rpred) + "', " + std::to_string(req_id) + ", 1, 0, NOW(6))";
+        if (OB_FAIL(ret = exec_session_sql(sql_engine, pc_service, session, context, task_sql))) {
+          return ret;
+        }
+      }
+    }
+    return OB_SUCCESS;
+  }
+
+  // Case 3: DELETE FROM <tbl> [WHERE ...]
+  if (first_kw == "delete") {
+    int ret = check_strict_read_for_sql(sql_engine, pc_service, session, context, clean_sql, default_db);
+    if (OB_FAIL(ret)) {
+      return ret;
+    }
+    size_t after_from = 0;
+    if (find_top_level_keyword(clean_sql, "from", pos, &after_from) == std::string::npos) {
+      return OB_SUCCESS;
+    }
+    size_t after_where = 0;
+    size_t where_pos = find_top_level_keyword(clean_sql, "where", after_from, &after_where);
+    std::string tbl_raw = (where_pos == std::string::npos)
+        ? trim_ws(clean_sql.substr(after_from))
+        : trim_ws(clean_sql.substr(after_from, where_pos - after_from));
+    std::string where_clause = (where_pos == std::string::npos)
+        ? ""
+        : trim_ws(clean_sql.substr(after_where));
+    std::string db_name, table_name;
+    split_qualified_table_name(tbl_raw, default_db, db_name, table_name);
+    if (str_tolower(db_name) == "oceanbase") {
+      return OB_SUCCESS;
+    }
+    std::vector<AiColumnMeta> ai_cols;
+    load_table_ai_columns(db_name, table_name, ai_cols);
+    if (ai_cols.empty()) {
+      return OB_SUCCESS;
+    }
+    handled = true;
+    std::vector<std::string> pk_cols;
+    load_table_pk_columns(ai_cols[0].table_id, pk_cols);
+    std::string sel_pk_sql =
+        "SELECT " + build_pk_select_list(pk_cols) + " FROM "
+        + quote_ident(db_name) + "." + quote_ident(table_name)
+        + (where_clause.empty() ? "" : (" WHERE " + where_clause));
+    std::vector<QueryRow> del_rows;
+    if (OB_FAIL(ret = exec_session_sql(sql_engine, pc_service, session, context, sel_pk_sql, &del_rows))) {
+      return ret;
+    }
+    for (size_t ri = 0; ri < del_rows.size(); ++ri) {
+      std::string rpred = build_rowkey_predicate(pk_cols, del_rows[ri]);
+      std::string del_task_sql =
+          "DELETE FROM oceanbase.__all_ai_column_task "
+          "WHERE table_id = " + std::to_string(ai_cols[0].table_id)
+          + " AND rowkey_predicate = '" + sql_escape(rpred) + "'";
+      if (OB_FAIL(ret = exec_session_sql(sql_engine, pc_service, session, context, del_task_sql))) {
+        return ret;
+      }
+    }
+    return exec_session_sql(sql_engine, pc_service, session, context, clean_sql);
+  }
+
+  return OB_SUCCESS;
+}
+
+} // namespace ai_column
+
 OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, ObResultSet &result)
 {
   int ret = OB_SUCCESS;
@@ -4528,6 +6510,34 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
         std::string rewritten_sql;
         if (OB_FAIL(file_sql::rewrite_select_file_funcs(raw_sql, rewritten_sql))) {
         } else if (OB_FAIL(ob_write_string(allocator, ObString(static_cast<int32_t>(rewritten_sql.size()), rewritten_sql.c_str()), trimed_stmt))) {
+        } else {
+          is_file_sql_rewritten = true;
+        }
+      }
+    }
+
+    if (OB_SUCC(ret) && !is_file_sql_rewritten && !ai_column::g_in_ai_column_internal && !session.is_inner()) {
+      ai_column::ensure_ai_worker_started();
+      ObString db_obstr = session.get_database_name();
+      std::string default_db(db_obstr.ptr() != NULL ? db_obstr.ptr() : "",
+                             db_obstr.ptr() != NULL ? static_cast<size_t>(db_obstr.length()) : 0);
+      bool ai_handled = false;
+      if (OB_FAIL(ai_column::handle_create_table_ai_column(
+              this, plan_cache_access_service_, session, context, raw_sql, default_db, ai_handled))) {
+        ectx.set_need_disconnect(false);
+      } else if (!ai_handled && OB_FAIL(ai_column::handle_alter_table_ai_column(
+              this, plan_cache_access_service_, session, context, raw_sql, default_db, ai_handled))) {
+        ectx.set_need_disconnect(false);
+      } else if (!ai_handled && OB_FAIL(ai_column::handle_drop_table_ai_column(raw_sql, default_db))) {
+        ectx.set_need_disconnect(false);
+      } else if (!ai_handled && OB_FAIL(ai_column::handle_dml_ai_column(
+              this, plan_cache_access_service_, session, context, raw_sql, default_db, ai_handled))) {
+        ectx.set_need_disconnect(false);
+      }
+      if (OB_SUCC(ret) && ai_handled) {
+        ectx.set_need_disconnect(false);
+        const char *noop_sql = "SET @@session.ai_column_strict_read = @@session.ai_column_strict_read";
+        if (OB_FAIL(ob_write_string(allocator, ObString::make_string(noop_sql), trimed_stmt))) {
         } else {
           is_file_sql_rewritten = true;
         }

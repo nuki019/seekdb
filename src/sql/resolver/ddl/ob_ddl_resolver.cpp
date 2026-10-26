@@ -1964,6 +1964,9 @@ int ObDDLResolver::resolve_column_definition(ObColumnSchemaV2 &column,
           }
         }
       }
+      if (OB_SUCC(ret) && column.get_column_name_str().prefix_match("__ai_col_")) {
+        column.set_is_hidden(true);
+      }
     }
   }
   return ret;
