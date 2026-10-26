@@ -38,6 +38,21 @@
 #include "sql/monitor/show_trace/ob_show_trace.h"
 #include "sql/optimizer/ob_optimizer.h"
 #include "share/rc/ob_server_runtime.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cctype>
+#include <cmath>
+#include <cerrno>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <map>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <glob.h>
+#endif
 
 namespace oceanbase
 {
@@ -1927,6 +1942,2501 @@ int ObSql::handle_ps_execute(const ObPsStmtId client_stmt_id,
   return ret;
 }
 
+namespace file_sql
+{
+
+enum FileColType
+{
+  COL_UNKNOWN = 0,
+  COL_BOOLEAN,
+  COL_BIGINT,
+  COL_DOUBLE,
+  COL_DATE,
+  COL_DATETIME,
+  COL_VARCHAR
+};
+
+struct FileCell
+{
+  bool is_null;
+  std::string val;
+  FileCell() : is_null(true), val() {}
+  FileCell(bool n, const std::string &v) : is_null(n), val(v) {}
+};
+
+struct FileColumn
+{
+  std::string name;
+  FileColType type;
+  bool has_null;
+  FileColumn() : name(), type(COL_UNKNOWN), has_null(false) {}
+};
+
+struct FileTable
+{
+  std::vector<FileColumn> cols;
+  std::vector<std::vector<FileCell>> rows;
+};
+
+struct NamedOption
+{
+  std::string key;
+  std::string val;
+  bool val_was_quoted;
+  NamedOption() : key(), val(), val_was_quoted(false) {}
+};
+
+static std::string str_trim(const std::string &s)
+{
+  size_t b = 0;
+  while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) {
+    ++b;
+  }
+  size_t e = s.size();
+  while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) {
+    --e;
+  }
+  return s.substr(b, e - b);
+}
+
+static std::string str_tolower(const std::string &s)
+{
+  std::string out = s;
+  for (size_t i = 0; i < out.size(); ++i) {
+    out[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(out[i])));
+  }
+  return out;
+}
+
+static bool is_ident_char(char c)
+{
+  unsigned char uc = static_cast<unsigned char>(c);
+  return std::isalnum(uc) || c == '_' || c == '$';
+}
+
+static bool is_bool_str(const std::string &s, bool &out_val)
+{
+  if (s.size() == 4 && 0 == STRNCASECMP(s.c_str(), "true", 4)) {
+    out_val = true;
+    return true;
+  }
+  if (s.size() == 5 && 0 == STRNCASECMP(s.c_str(), "false", 5)) {
+    out_val = false;
+    return true;
+  }
+  return false;
+}
+
+static bool is_int64_str(const std::string &s)
+{
+  if (s.empty()) {
+    return false;
+  }
+  size_t idx = 0;
+  if (s[0] == '+' || s[0] == '-') {
+    idx = 1;
+  }
+  if (idx >= s.size()) {
+    return false;
+  }
+  if (s.size() - idx > 1 && s[idx] == '0') {
+    return false;
+  }
+  for (size_t i = idx; i < s.size(); ++i) {
+    if (!std::isdigit(static_cast<unsigned char>(s[i]))) {
+      return false;
+    }
+  }
+  errno = 0;
+  char *endp = NULL;
+  (void)std::strtoll(s.c_str(), &endp, 10);
+  return errno == 0 && endp == s.c_str() + s.size();
+}
+
+static bool is_double_str(const std::string &s)
+{
+  if (s.empty()) {
+    return false;
+  }
+  if (std::isspace(static_cast<unsigned char>(s.front()))
+      || std::isspace(static_cast<unsigned char>(s.back()))) {
+    return false;
+  }
+  errno = 0;
+  char *endp = NULL;
+  double v = std::strtod(s.c_str(), &endp);
+  if (errno != 0 || endp != s.c_str() + s.size() || !std::isfinite(v)) {
+    return false;
+  }
+  return true;
+}
+
+static bool is_date_str(const std::string &s)
+{
+  if (s.size() != 10 || s[4] != '-' || s[7] != '-') {
+    return false;
+  }
+  for (size_t i = 0; i < 10; ++i) {
+    if (i == 4 || i == 7) {
+      continue;
+    }
+    if (!std::isdigit(static_cast<unsigned char>(s[i]))) {
+      return false;
+    }
+  }
+  int m = (s[5] - '0') * 10 + (s[6] - '0');
+  int d = (s[8] - '0') * 10 + (s[9] - '0');
+  return (m >= 1 && m <= 12 && d >= 1 && d <= 31);
+}
+
+static bool is_datetime_str(const std::string &s, std::string *normalized = NULL)
+{
+  if (s.size() < 19) {
+    return false;
+  }
+  if (!is_date_str(s.substr(0, 10))) {
+    return false;
+  }
+  if (s[10] != ' ' && s[10] != 'T' && s[10] != 't') {
+    return false;
+  }
+  if (s[13] != ':' || s[16] != ':') {
+    return false;
+  }
+  const int digit_pos[6] = {11, 12, 14, 15, 17, 18};
+  for (int i = 0; i < 6; ++i) {
+    if (!std::isdigit(static_cast<unsigned char>(s[digit_pos[i]]))) {
+      return false;
+    }
+  }
+  int hh = (s[11] - '0') * 10 + (s[12] - '0');
+  int mm = (s[14] - '0') * 10 + (s[15] - '0');
+  int ss = (s[17] - '0') * 10 + (s[18] - '0');
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59 || ss < 0 || ss > 59) {
+    return false;
+  }
+  if (s.size() > 19) {
+    if (s[19] != '.' || s.size() == 20 || s.size() > 26) {
+      return false;
+    }
+    for (size_t i = 20; i < s.size(); ++i) {
+      if (!std::isdigit(static_cast<unsigned char>(s[i]))) {
+        return false;
+      }
+    }
+  }
+  if (NULL != normalized) {
+    *normalized = s;
+    (*normalized)[10] = ' ';
+  }
+  return true;
+}
+
+static FileColType infer_string_token_type(const std::string &s)
+{
+  bool bval = false;
+  if (is_bool_str(s, bval)) {
+    return COL_BOOLEAN;
+  }
+  if (is_int64_str(s)) {
+    return COL_BIGINT;
+  }
+  if (is_double_str(s)) {
+    return COL_DOUBLE;
+  }
+  if (is_date_str(s)) {
+    return COL_DATE;
+  }
+  if (is_datetime_str(s)) {
+    return COL_DATETIME;
+  }
+  return COL_VARCHAR;
+}
+
+static FileColType merge_col_type(FileColType a, FileColType b)
+{
+  if (a == COL_UNKNOWN) {
+    return b;
+  }
+  if (b == COL_UNKNOWN || a == b) {
+    return a;
+  }
+  if ((a == COL_BIGINT && b == COL_DOUBLE) || (a == COL_DOUBLE && b == COL_BIGINT)) {
+    return COL_DOUBLE;
+  }
+  if ((a == COL_DATE && b == COL_DATETIME) || (a == COL_DATETIME && b == COL_DATE)) {
+    return COL_DATETIME;
+  }
+  return COL_VARCHAR;
+}
+
+static const char *col_type_to_describe_name(FileColType t)
+{
+  switch (t) {
+    case COL_BOOLEAN: return "BOOLEAN";
+    case COL_BIGINT: return "BIGINT";
+    case COL_DOUBLE: return "DOUBLE";
+    case COL_DATE: return "DATE";
+    case COL_DATETIME: return "DATETIME";
+    case COL_VARCHAR:
+    default: return "VARCHAR";
+  }
+}
+
+static std::string escape_sql_string(const std::string &s)
+{
+  std::string out;
+  out.reserve(s.size() + 8);
+  out.push_back('\'');
+  for (size_t i = 0; i < s.size(); ++i) {
+    char c = s[i];
+    if (c == '\'') {
+      out.append("''");
+    } else if (c == '\\') {
+      out.append("\\\\");
+    } else if (c == '\0') {
+      out.append("\\0");
+    } else {
+      out.push_back(c);
+    }
+  }
+  out.push_back('\'');
+  return out;
+}
+
+static std::string escape_sql_ident(const std::string &ident)
+{
+  std::string out;
+  out.reserve(ident.size() + 4);
+  out.push_back('`');
+  for (size_t i = 0; i < ident.size(); ++i) {
+    if (ident[i] == '`') {
+      out.append("``");
+    } else {
+      out.push_back(ident[i]);
+    }
+  }
+  out.push_back('`');
+  return out;
+}
+
+static std::string format_cell_sql_expr(const FileCell &cell, FileColType col_type)
+{
+  if (cell.is_null) {
+    switch (col_type) {
+      case COL_BOOLEAN:
+      case COL_BIGINT:
+        return "CAST(NULL AS SIGNED)";
+      case COL_DOUBLE:
+        return "CAST(NULL AS DOUBLE)";
+      case COL_DATE:
+        return "CAST(NULL AS DATE)";
+      case COL_DATETIME:
+        return "CAST(NULL AS DATETIME)";
+      case COL_VARCHAR:
+      default:
+        return "CAST(NULL AS CHAR(256))";
+    }
+  }
+  switch (col_type) {
+    case COL_BOOLEAN: {
+      bool bval = false;
+      if (is_bool_str(cell.val, bval)) {
+        return bval ? "CAST(1 AS SIGNED)" : "CAST(0 AS SIGNED)";
+      }
+      return (cell.val != "0") ? "CAST(1 AS SIGNED)" : "CAST(0 AS SIGNED)";
+    }
+    case COL_BIGINT:
+      return "CAST(" + cell.val + " AS SIGNED)";
+    case COL_DOUBLE:
+      return "CAST(" + cell.val + " AS DOUBLE)";
+    case COL_DATE:
+      return "CAST(" + escape_sql_string(cell.val) + " AS DATE)";
+    case COL_DATETIME: {
+      std::string norm = cell.val;
+      (void)is_datetime_str(cell.val, &norm);
+      return "CAST(" + escape_sql_string(norm) + " AS DATETIME)";
+    }
+    case COL_VARCHAR:
+    default:
+      return escape_sql_string(cell.val);
+  }
+}
+
+static int read_entire_file(const std::string &path, std::string &out_content)
+{
+  int ret = OB_SUCCESS;
+  out_content.clear();
+  std::FILE *fp = std::fopen(path.c_str(), "rb");
+  if (NULL == fp) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "file path (cannot open file)");
+  } else {
+    char buf[8192];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), fp)) > 0) {
+      out_content.append(buf, n);
+    }
+    if (std::ferror(fp)) {
+      ret = OB_INVALID_ARGUMENT;
+    }
+    std::fclose(fp);
+  }
+  return ret;
+}
+
+static bool unquote_sql_literal(const std::string &raw, std::string &out, bool &was_quoted)
+{
+  std::string s = str_trim(raw);
+  was_quoted = false;
+  if (s.size() >= 2 && ((s.front() == '\'' && s.back() == '\'') || (s.front() == '"' && s.back() == '"'))) {
+    char q = s.front();
+    out.clear();
+    for (size_t i = 1; i + 1 < s.size(); ++i) {
+      if (s[i] == q && i + 2 < s.size() && s[i + 1] == q) {
+        out.push_back(q);
+        ++i;
+      } else if (s[i] == '\\' && i + 2 < s.size()) {
+        char nx = s[i + 1];
+        if (nx == 'n') { out.push_back('\n'); }
+        else if (nx == 'r') { out.push_back('\r'); }
+        else if (nx == 't') { out.push_back('\t'); }
+        else { out.push_back(nx); }
+        ++i;
+      } else if (s[i] == q) {
+        return false;
+      } else {
+        out.push_back(s[i]);
+      }
+    }
+    was_quoted = true;
+    return true;
+  }
+  out = s;
+  return true;
+}
+
+static int parse_table_func_args(const std::string &args_str,
+                                 std::string &out_path,
+                                 std::vector<NamedOption> &out_opts)
+{
+  int ret = OB_SUCCESS;
+  out_path.clear();
+  out_opts.clear();
+  std::vector<std::string> parts;
+  size_t cur_start = 0;
+  char in_quote = 0;
+  int paren_depth = 0;
+  for (size_t i = 0; i < args_str.size(); ++i) {
+    char c = args_str[i];
+    if (in_quote != 0) {
+      if (c == '\\' && i + 1 < args_str.size()) {
+        ++i;
+      } else if (c == in_quote) {
+        if (i + 1 < args_str.size() && args_str[i + 1] == in_quote) {
+          ++i;
+        } else {
+          in_quote = 0;
+        }
+      }
+    } else {
+      if (c == '\'' || c == '"') {
+        in_quote = c;
+      } else if (c == '(') {
+        ++paren_depth;
+      } else if (c == ')') {
+        if (paren_depth > 0) {
+          --paren_depth;
+        }
+      } else if (c == ',' && paren_depth == 0) {
+        parts.push_back(str_trim(args_str.substr(cur_start, i - cur_start)));
+        cur_start = i + 1;
+      }
+    }
+  }
+  if (in_quote != 0 || paren_depth != 0) {
+    ret = OB_ERR_PARSE_SQL;
+    LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
+                   static_cast<int>(args_str.size()), args_str.c_str(), 1);
+    return ret;
+  }
+  std::string tail = str_trim(args_str.substr(cur_start));
+  if (!tail.empty() || !parts.empty()) {
+    parts.push_back(tail);
+  }
+  if (parts.empty() || parts[0].empty()) {
+    ret = OB_ERR_PARSE_SQL;
+    LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
+                   static_cast<int>(args_str.size()), args_str.c_str(), 1);
+    return ret;
+  }
+  bool first_quoted = false;
+  if (!unquote_sql_literal(parts[0], out_path, first_quoted) || !first_quoted || parts[0].find('=') != std::string::npos && !first_quoted) {
+    ret = OB_ERR_PARSE_SQL;
+    LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
+                   static_cast<int>(parts[0].size()), parts[0].c_str(), 1);
+    return ret;
+  }
+  for (size_t i = 1; i < parts.size(); ++i) {
+    const std::string &p = parts[i];
+    if (p.empty()) {
+      ret = OB_ERR_PARSE_SQL;
+      LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX), 0, "", 1);
+      return ret;
+    }
+    size_t eq_pos = std::string::npos;
+    char q = 0;
+    for (size_t k = 0; k < p.size(); ++k) {
+      if (q != 0) {
+        if (p[k] == '\\' && k + 1 < p.size()) {
+          ++k;
+        } else if (p[k] == q) {
+          if (k + 1 < p.size() && p[k + 1] == q) {
+            ++k;
+          } else {
+            q = 0;
+          }
+        }
+      } else {
+        if (p[k] == '\'' || p[k] == '"') {
+          q = p[k];
+        } else if (p[k] == '=') {
+          eq_pos = k;
+          break;
+        }
+      }
+    }
+    if (eq_pos == std::string::npos) {
+      ret = OB_ERR_PARSE_SQL;
+      LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
+                     static_cast<int>(p.size()), p.c_str(), 1);
+      return ret;
+    }
+    std::string k_str = str_tolower(str_trim(p.substr(0, eq_pos)));
+    std::string v_raw = str_trim(p.substr(eq_pos + 1));
+    if (k_str.empty() || v_raw.empty()) {
+      ret = OB_ERR_PARSE_SQL;
+      LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
+                     static_cast<int>(p.size()), p.c_str(), 1);
+      return ret;
+    }
+    for (size_t c_idx = 0; c_idx < k_str.size(); ++c_idx) {
+      if (!is_ident_char(k_str[c_idx])) {
+        ret = OB_ERR_PARSE_SQL;
+        LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
+                       static_cast<int>(p.size()), p.c_str(), 1);
+        return ret;
+      }
+    }
+    NamedOption opt;
+    opt.key = k_str;
+    if (!unquote_sql_literal(v_raw, opt.val, opt.val_was_quoted)) {
+      ret = OB_ERR_PARSE_SQL;
+      LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
+                     static_cast<int>(v_raw.size()), v_raw.c_str(), 1);
+      return ret;
+    }
+    out_opts.push_back(opt);
+  }
+  return ret;
+}
+
+struct CsvFieldToken
+{
+  std::string val;
+  bool was_quoted;
+  CsvFieldToken() : val(), was_quoted(false) {}
+};
+
+static int read_csv_file(const std::string &path,
+                         const std::vector<NamedOption> &opts,
+                         FileTable &table)
+{
+  int ret = OB_SUCCESS;
+  bool has_header = true;
+  char delim = ',';
+  char quote = '"';
+  std::string nullstr = "";
+  bool has_custom_nullstr = false;
+
+  for (size_t i = 0; i < opts.size(); ++i) {
+    const std::string &k = opts[i].key;
+    const std::string &v = opts[i].val;
+    std::string v_low = str_tolower(v);
+    if (k == "header") {
+      if (v_low == "true" || v_low == "1") {
+        has_header = true;
+      } else if (v_low == "false" || v_low == "0") {
+        has_header = false;
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "invalid header option in read_csv");
+        return ret;
+      }
+    } else if (k == "sample_size") {
+      if (v != "-1") {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "sample_size option other than -1 in read_csv");
+        return ret;
+      }
+    } else if (k == "delim" || k == "sep" || k == "delimiter") {
+      if (v.size() != 1) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "multi-character delimiter in read_csv");
+        return ret;
+      }
+      delim = v[0];
+    } else if (k == "quote") {
+      if (v.size() != 1) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "multi-character quote in read_csv");
+        return ret;
+      }
+      quote = v[0];
+    } else if (k == "nullstr" || k == "null") {
+      nullstr = v;
+      has_custom_nullstr = true;
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "unsupported option in read_csv");
+      return ret;
+    }
+  }
+
+  std::string content;
+  if (OB_FAIL(read_entire_file(path, content))) {
+    return ret;
+  }
+  size_t pos = 0;
+  if (content.size() >= 3
+      && static_cast<unsigned char>(content[0]) == 0xEF
+      && static_cast<unsigned char>(content[1]) == 0xBB
+      && static_cast<unsigned char>(content[2]) == 0xBF) {
+    pos = 3;
+  }
+
+  std::vector<std::vector<CsvFieldToken>> raw_rows;
+  std::vector<CsvFieldToken> cur_row;
+  CsvFieldToken cur_field;
+  bool in_quotes = false;
+  bool at_field_start = true;
+
+  while (pos < content.size()) {
+    char c = content[pos];
+    if (in_quotes) {
+      if (c == quote) {
+        if (pos + 1 < content.size() && content[pos + 1] == quote) {
+          cur_field.val.push_back(quote);
+          pos += 2;
+        } else {
+          in_quotes = false;
+          ++pos;
+        }
+      } else if (c == '\r') {
+        if (pos + 1 < content.size() && content[pos + 1] == '\n') {
+          ++pos;
+        }
+        cur_field.val.push_back('\n');
+        ++pos;
+      } else {
+        cur_field.val.push_back(c);
+        ++pos;
+      }
+    } else {
+      if (at_field_start && c == quote) {
+        in_quotes = true;
+        cur_field.was_quoted = true;
+        at_field_start = false;
+        ++pos;
+      } else if (c == delim) {
+        cur_row.push_back(cur_field);
+        cur_field = CsvFieldToken();
+        at_field_start = true;
+        ++pos;
+      } else if (c == '\r' || c == '\n') {
+        if (c == '\r' && pos + 1 < content.size() && content[pos + 1] == '\n') {
+          ++pos;
+        }
+        cur_row.push_back(cur_field);
+        raw_rows.push_back(cur_row);
+        cur_row.clear();
+        cur_field = CsvFieldToken();
+        at_field_start = true;
+        ++pos;
+      } else {
+        cur_field.val.push_back(c);
+        at_field_start = false;
+        ++pos;
+      }
+    }
+  }
+  if (in_quotes) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "unterminated quoted field in CSV");
+    return ret;
+  }
+  if (!cur_row.empty() || !cur_field.val.empty() || cur_field.was_quoted) {
+    cur_row.push_back(cur_field);
+    raw_rows.push_back(cur_row);
+  }
+  if (raw_rows.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "empty CSV file");
+    return ret;
+  }
+
+  size_t num_cols = raw_rows[0].size();
+  if (num_cols == 0) {
+    ret = OB_INVALID_ARGUMENT;
+    return ret;
+  }
+  table.cols.resize(num_cols);
+  size_t data_start_idx = 0;
+  if (has_header) {
+    data_start_idx = 1;
+    std::map<std::string, int> name_counts;
+    for (size_t j = 0; j < num_cols; ++j) {
+      std::string base = raw_rows[0][j].val;
+      if (base.empty()) {
+        base = "column" + std::to_string(j);
+      }
+      int cnt = ++name_counts[base];
+      std::string final_name = base;
+      if (cnt > 1) {
+        final_name = base + "__" + std::to_string(cnt);
+      }
+      table.cols[j].name = final_name;
+    }
+  } else {
+    for (size_t j = 0; j < num_cols; ++j) {
+      table.cols[j].name = "column" + std::to_string(j);
+    }
+  }
+
+  for (size_t r = data_start_idx; r < raw_rows.size(); ++r) {
+    const std::vector<CsvFieldToken> &src_row = raw_rows[r];
+    if (src_row.size() == 1 && src_row[0].val.empty() && !src_row[0].was_quoted && num_cols > 1) {
+      continue;
+    }
+    std::vector<FileCell> dst_row(num_cols);
+    for (size_t j = 0; j < num_cols; ++j) {
+      if (j >= src_row.size()) {
+        dst_row[j].is_null = true;
+        table.cols[j].has_null = true;
+      } else {
+        const CsvFieldToken &tok = src_row[j];
+        bool is_null_cell = false;
+        if (!tok.was_quoted) {
+          if (tok.val.empty() || tok.val == "NULL") {
+            is_null_cell = true;
+          } else if (has_custom_nullstr && tok.val == nullstr) {
+            is_null_cell = true;
+          }
+        }
+        if (is_null_cell) {
+          dst_row[j].is_null = true;
+          table.cols[j].has_null = true;
+        } else {
+          dst_row[j].is_null = false;
+          dst_row[j].val = tok.val;
+          FileColType t = infer_string_token_type(tok.val);
+          table.cols[j].type = merge_col_type(table.cols[j].type, t);
+        }
+      }
+    }
+    table.rows.push_back(dst_row);
+  }
+
+  for (size_t j = 0; j < num_cols; ++j) {
+    if (table.cols[j].type == COL_UNKNOWN) {
+      table.cols[j].type = COL_VARCHAR;
+    }
+    if (table.rows.empty()) {
+      table.cols[j].has_null = true;
+    }
+  }
+  return ret;
+}
+
+struct SimpleJsonValue
+{
+  enum Kind { J_NULL, J_BOOL, J_INT, J_DOUBLE, J_STR, J_OBJ, J_ARR };
+  Kind kind;
+  std::string str_val;
+  std::vector<std::pair<std::string, SimpleJsonValue>> obj_fields;
+  SimpleJsonValue() : kind(J_NULL), str_val(), obj_fields() {}
+};
+
+class SimpleJsonParser
+{
+public:
+  SimpleJsonParser(const char *p, size_t len) : p_(p), len_(len), pos_(0) {}
+
+  void skip_ws()
+  {
+    while (pos_ < len_ && std::isspace(static_cast<unsigned char>(p_[pos_]))) {
+      ++pos_;
+    }
+  }
+
+  bool eof() { skip_ws(); return pos_ >= len_; }
+
+  bool parse_value(SimpleJsonValue &out)
+  {
+    skip_ws();
+    if (pos_ >= len_) {
+      return false;
+    }
+    char c = p_[pos_];
+    if (c == '{') {
+      return parse_object(out);
+    } else if (c == '[') {
+      return parse_array(out);
+    } else if (c == '"') {
+      out.kind = SimpleJsonValue::J_STR;
+      return parse_string(out.str_val);
+    } else if (c == 't') {
+      if (pos_ + 4 <= len_ && 0 == std::memcmp(p_ + pos_, "true", 4)) {
+        pos_ += 4;
+        out.kind = SimpleJsonValue::J_BOOL;
+        out.str_val = "true";
+        return true;
+      }
+      return false;
+    } else if (c == 'f') {
+      if (pos_ + 5 <= len_ && 0 == std::memcmp(p_ + pos_, "false", 5)) {
+        pos_ += 5;
+        out.kind = SimpleJsonValue::J_BOOL;
+        out.str_val = "false";
+        return true;
+      }
+      return false;
+    } else if (c == 'n') {
+      if (pos_ + 4 <= len_ && 0 == std::memcmp(p_ + pos_, "null", 4)) {
+        pos_ += 4;
+        out.kind = SimpleJsonValue::J_NULL;
+        return true;
+      }
+      return false;
+    } else if (c == '-' || std::isdigit(static_cast<unsigned char>(c))) {
+      return parse_number(out);
+    }
+    return false;
+  }
+
+  bool parse_string(std::string &out)
+  {
+    out.clear();
+    if (pos_ >= len_ || p_[pos_] != '"') {
+      return false;
+    }
+    ++pos_;
+    while (pos_ < len_) {
+      char c = p_[pos_++];
+      if (c == '"') {
+        return true;
+      } else if (c == '\\') {
+        if (pos_ >= len_) {
+          return false;
+        }
+        char esc = p_[pos_++];
+        switch (esc) {
+          case '"': out.push_back('"'); break;
+          case '\\': out.push_back('\\'); break;
+          case '/': out.push_back('/'); break;
+          case 'b': out.push_back('\b'); break;
+          case 'f': out.push_back('\f'); break;
+          case 'n': out.push_back('\n'); break;
+          case 'r': out.push_back('\r'); break;
+          case 't': out.push_back('\t'); break;
+          case 'u': {
+            if (pos_ + 4 > len_) {
+              return false;
+            }
+            unsigned int cp = 0;
+            for (int k = 0; k < 4; ++k) {
+              char hc = p_[pos_++];
+              cp <<= 4;
+              if (hc >= '0' && hc <= '9') cp |= (hc - '0');
+              else if (hc >= 'a' && hc <= 'f') cp |= (hc - 'a' + 10);
+              else if (hc >= 'A' && hc <= 'F') cp |= (hc - 'A' + 10);
+              else return false;
+            }
+            if (cp <= 0x7F) {
+              out.push_back(static_cast<char>(cp));
+            } else if (cp <= 0x7FF) {
+              out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+              out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            } else {
+              out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+              out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+              out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            }
+            break;
+          }
+          default:
+            return false;
+        }
+      } else if (static_cast<unsigned char>(c) < 0x20) {
+        return false;
+      } else {
+        out.push_back(c);
+      }
+    }
+    return false;
+  }
+
+  bool parse_number(SimpleJsonValue &out)
+  {
+    size_t start = pos_;
+    bool is_float = false;
+    if (p_[pos_] == '-') {
+      ++pos_;
+    }
+    if (pos_ >= len_ || !std::isdigit(static_cast<unsigned char>(p_[pos_]))) {
+      return false;
+    }
+    if (p_[pos_] == '0') {
+      ++pos_;
+    } else {
+      while (pos_ < len_ && std::isdigit(static_cast<unsigned char>(p_[pos_]))) {
+        ++pos_;
+      }
+    }
+    if (pos_ < len_ && p_[pos_] == '.') {
+      is_float = true;
+      ++pos_;
+      if (pos_ >= len_ || !std::isdigit(static_cast<unsigned char>(p_[pos_]))) {
+        return false;
+      }
+      while (pos_ < len_ && std::isdigit(static_cast<unsigned char>(p_[pos_]))) {
+        ++pos_;
+      }
+    }
+    if (pos_ < len_ && (p_[pos_] == 'e' || p_[pos_] == 'E')) {
+      is_float = true;
+      ++pos_;
+      if (pos_ < len_ && (p_[pos_] == '+' || p_[pos_] == '-')) {
+        ++pos_;
+      }
+      if (pos_ >= len_ || !std::isdigit(static_cast<unsigned char>(p_[pos_]))) {
+        return false;
+      }
+      while (pos_ < len_ && std::isdigit(static_cast<unsigned char>(p_[pos_]))) {
+        ++pos_;
+      }
+    }
+    out.str_val.assign(p_ + start, pos_ - start);
+    if (!is_float && is_int64_str(out.str_val)) {
+      out.kind = SimpleJsonValue::J_INT;
+    } else if (is_double_str(out.str_val)) {
+      out.kind = SimpleJsonValue::J_DOUBLE;
+    } else {
+      return false;
+    }
+    return true;
+  }
+
+  bool parse_object(SimpleJsonValue &out)
+  {
+    out.kind = SimpleJsonValue::J_OBJ;
+    out.obj_fields.clear();
+    size_t start = pos_;
+    ++pos_; // skip '{'
+    skip_ws();
+    if (pos_ < len_ && p_[pos_] == '}') {
+      ++pos_;
+      out.str_val.assign(p_ + start, pos_ - start);
+      return true;
+    }
+    while (pos_ < len_) {
+      skip_ws();
+      std::string key;
+      if (!parse_string(key)) {
+        return false;
+      }
+      skip_ws();
+      if (pos_ >= len_ || p_[pos_] != ':') {
+        return false;
+      }
+      ++pos_;
+      SimpleJsonValue val;
+      if (!parse_value(val)) {
+        return false;
+      }
+      out.obj_fields.push_back(std::make_pair(key, val));
+      skip_ws();
+      if (pos_ < len_ && p_[pos_] == ',') {
+        ++pos_;
+      } else if (pos_ < len_ && p_[pos_] == '}') {
+        ++pos_;
+        out.str_val.assign(p_ + start, pos_ - start);
+        return true;
+      } else {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  bool parse_array(SimpleJsonValue &out)
+  {
+    out.kind = SimpleJsonValue::J_ARR;
+    size_t start = pos_;
+    ++pos_; // skip '['
+    skip_ws();
+    if (pos_ < len_ && p_[pos_] == ']') {
+      ++pos_;
+      out.str_val.assign(p_ + start, pos_ - start);
+      return true;
+    }
+    while (pos_ < len_) {
+      SimpleJsonValue elem;
+      if (!parse_value(elem)) {
+        return false;
+      }
+      skip_ws();
+      if (pos_ < len_ && p_[pos_] == ',') {
+        ++pos_;
+      } else if (pos_ < len_ && p_[pos_] == ']') {
+        ++pos_;
+        out.str_val.assign(p_ + start, pos_ - start);
+        return true;
+      } else {
+        return false;
+      }
+    }
+    return false;
+  }
+
+private:
+  const char *p_;
+  size_t len_;
+  size_t pos_;
+};
+
+static int read_json_file(const std::string &path,
+                          const std::vector<NamedOption> &opts,
+                          FileTable &table)
+{
+  int ret = OB_SUCCESS;
+  std::string format = "auto";
+  for (size_t i = 0; i < opts.size(); ++i) {
+    const std::string &k = opts[i].key;
+    std::string v_low = str_tolower(opts[i].val);
+    if (k == "format") {
+      if (v_low == "newline_delimited" || v_low == "ndjson" || v_low == "auto" || v_low == "array") {
+        format = v_low;
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "unsupported format in read_json");
+        return ret;
+      }
+    } else if (k == "sample_size") {
+      if (opts[i].val != "-1") {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "sample_size option other than -1 in read_json");
+        return ret;
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "unsupported option in read_json");
+      return ret;
+    }
+  }
+
+  std::string content;
+  if (OB_FAIL(read_entire_file(path, content))) {
+    return ret;
+  }
+
+  std::vector<SimpleJsonValue> objects;
+  size_t line_start = 0;
+  while (line_start < content.size()) {
+    size_t line_end = content.find('\n', line_start);
+    if (line_end == std::string::npos) {
+      line_end = content.size();
+    }
+    std::string line = str_trim(content.substr(line_start, line_end - line_start));
+    line_start = line_end + 1;
+    if (line.empty()) {
+      continue;
+    }
+    SimpleJsonParser parser(line.c_str(), line.size());
+    SimpleJsonValue jval;
+    if (!parser.parse_value(jval) || !parser.eof() || jval.kind != SimpleJsonValue::J_OBJ) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "invalid JSON object line");
+      return ret;
+    }
+    objects.push_back(jval);
+  }
+
+  if (objects.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "empty JSON file");
+    return ret;
+  }
+
+  std::map<std::string, size_t> col_idx_map;
+  for (size_t r = 0; r < objects.size(); ++r) {
+    const auto &fields = objects[r].obj_fields;
+    for (size_t f = 0; f < fields.size(); ++f) {
+      const std::string &k = fields[f].first;
+      if (col_idx_map.find(k) == col_idx_map.end()) {
+        size_t idx = table.cols.size();
+        col_idx_map[k] = idx;
+        FileColumn col;
+        col.name = k;
+        table.cols.push_back(col);
+      }
+    }
+  }
+
+  size_t num_cols = table.cols.size();
+  if (num_cols == 0) {
+    ret = OB_INVALID_ARGUMENT;
+    return ret;
+  }
+
+  for (size_t r = 0; r < objects.size(); ++r) {
+    std::vector<FileCell> row(num_cols);
+    std::vector<bool> seen(num_cols, false);
+    const auto &fields = objects[r].obj_fields;
+    for (size_t f = 0; f < fields.size(); ++f) {
+      size_t cidx = col_idx_map[fields[f].first];
+      seen[cidx] = true;
+      const SimpleJsonValue &v = fields[f].second;
+      if (v.kind == SimpleJsonValue::J_NULL) {
+        row[cidx].is_null = true;
+        table.cols[cidx].has_null = true;
+      } else {
+        row[cidx].is_null = false;
+        row[cidx].val = v.str_val;
+        FileColType t = COL_VARCHAR;
+        if (v.kind == SimpleJsonValue::J_BOOL) {
+          t = COL_BOOLEAN;
+        } else if (v.kind == SimpleJsonValue::J_INT) {
+          t = COL_BIGINT;
+        } else if (v.kind == SimpleJsonValue::J_DOUBLE) {
+          t = COL_DOUBLE;
+        } else if (v.kind == SimpleJsonValue::J_STR) {
+          if (is_date_str(v.str_val)) {
+            t = COL_DATE;
+          } else if (is_datetime_str(v.str_val)) {
+            t = COL_DATETIME;
+          } else {
+            t = COL_VARCHAR;
+          }
+        }
+        table.cols[cidx].type = merge_col_type(table.cols[cidx].type, t);
+      }
+    }
+    for (size_t j = 0; j < num_cols; ++j) {
+      if (!seen[j]) {
+        row[j].is_null = true;
+        table.cols[j].has_null = true;
+      }
+    }
+    table.rows.push_back(row);
+  }
+
+  for (size_t j = 0; j < num_cols; ++j) {
+    if (table.cols[j].type == COL_UNKNOWN) {
+      table.cols[j].type = COL_VARCHAR;
+    }
+  }
+  return ret;
+}
+
+class ThriftCompactReader
+{
+public:
+  ThriftCompactReader(const uint8_t *buf, size_t len) : buf_(buf), len_(len), pos_(0), ok_(true) {}
+
+  bool ok() const { return ok_; }
+  size_t pos() const { return pos_; }
+
+  uint8_t read_u8()
+  {
+    if (pos_ >= len_) {
+      ok_ = false;
+      return 0;
+    }
+    return buf_[pos_++];
+  }
+
+  uint64_t read_varint()
+  {
+    uint64_t result = 0;
+    int shift = 0;
+    while (pos_ < len_) {
+      uint8_t b = buf_[pos_++];
+      result |= static_cast<uint64_t>(b & 0x7F) << shift;
+      if ((b & 0x80) == 0) {
+        return result;
+      }
+      shift += 7;
+      if (shift >= 64) {
+        ok_ = false;
+        return 0;
+      }
+    }
+    ok_ = false;
+    return 0;
+  }
+
+  int64_t read_zigzag()
+  {
+    uint64_t n = read_varint();
+    return static_cast<int64_t>((n >> 1) ^ (~(n & 1) + 1));
+  }
+
+  std::string read_binary()
+  {
+    uint64_t slen = read_varint();
+    if (!ok_ || pos_ + slen > len_) {
+      ok_ = false;
+      return "";
+    }
+    std::string s(reinterpret_cast<const char *>(buf_ + pos_), static_cast<size_t>(slen));
+    pos_ += static_cast<size_t>(slen);
+    return s;
+  }
+
+  bool read_field_header(int16_t &last_field_id, int16_t &field_id, uint8_t &field_type)
+  {
+    uint8_t b = read_u8();
+    if (!ok_ || b == 0) {
+      field_type = 0;
+      return false;
+    }
+    field_type = b & 0x0F;
+    uint8_t delta = (b >> 4) & 0x0F;
+    if (delta == 0) {
+      field_id = static_cast<int16_t>(read_zigzag());
+    } else {
+      field_id = static_cast<int16_t>(last_field_id + delta);
+    }
+    last_field_id = field_id;
+    return ok_;
+  }
+
+  bool read_list_header(uint8_t &elem_type, uint64_t &count)
+  {
+    uint8_t b = read_u8();
+    if (!ok_) {
+      return false;
+    }
+    elem_type = b & 0x0F;
+    uint8_t hi = (b >> 4) & 0x0F;
+    if (hi == 15) {
+      count = read_varint();
+    } else {
+      count = hi;
+    }
+    return ok_;
+  }
+
+  void skip_value(uint8_t type)
+  {
+    if (!ok_) {
+      return;
+    }
+    switch (type) {
+      case 1:
+      case 2:
+        break;
+      case 3:
+        (void)read_u8();
+        break;
+      case 4:
+      case 5:
+      case 6:
+        (void)read_varint();
+        break;
+      case 7:
+        if (pos_ + 8 > len_) { ok_ = false; } else { pos_ += 8; }
+        break;
+      case 8:
+        (void)read_binary();
+        break;
+      case 9:
+      case 10: {
+        uint8_t et = 0;
+        uint64_t cnt = 0;
+        if (read_list_header(et, cnt)) {
+          for (uint64_t i = 0; i < cnt && ok_; ++i) {
+            skip_value(et);
+          }
+        }
+        break;
+      }
+      case 11: {
+        uint64_t cnt = read_varint();
+        if (cnt > 0 && ok_) {
+          uint8_t kv = read_u8();
+          uint8_t kt = (kv >> 4) & 0x0F;
+          uint8_t vt = kv & 0x0F;
+          for (uint64_t i = 0; i < cnt && ok_; ++i) {
+            skip_value(kt);
+            skip_value(vt);
+          }
+        }
+        break;
+      }
+      case 12: {
+        int16_t last_fid = 0;
+        int16_t fid = 0;
+        uint8_t ft = 0;
+        while (read_field_header(last_fid, fid, ft)) {
+          skip_value(ft);
+        }
+        break;
+      }
+      default:
+        ok_ = false;
+        break;
+    }
+  }
+
+private:
+  const uint8_t *buf_;
+  size_t len_;
+  size_t pos_;
+  bool ok_;
+};
+
+static bool snappy_decompress(const uint8_t *src, size_t src_len, std::vector<uint8_t> &dst)
+{
+  size_t pos = 0;
+  uint64_t uncompressed_len = 0;
+  int shift = 0;
+  while (pos < src_len) {
+    uint8_t b = src[pos++];
+    uncompressed_len |= static_cast<uint64_t>(b & 0x7F) << shift;
+    if ((b & 0x80) == 0) {
+      break;
+    }
+    shift += 7;
+    if (shift >= 32) {
+      return false;
+    }
+  }
+  if (uncompressed_len > 256ULL * 1024ULL * 1024ULL) {
+    return false;
+  }
+  dst.clear();
+  dst.reserve(static_cast<size_t>(uncompressed_len));
+  while (pos < src_len) {
+    uint8_t tag = src[pos++];
+    uint8_t tag_type = tag & 0x03;
+    if (tag_type == 0) {
+      uint32_t len = (tag >> 2) + 1;
+      if ((tag >> 2) >= 60) {
+        uint32_t extra_bytes = (tag >> 2) - 59;
+        if (pos + extra_bytes > src_len) {
+          return false;
+        }
+        len = 0;
+        for (uint32_t k = 0; k < extra_bytes; ++k) {
+          len |= static_cast<uint32_t>(src[pos++]) << (8 * k);
+        }
+        len += 1;
+      }
+      if (pos + len > src_len) {
+        return false;
+      }
+      dst.insert(dst.end(), src + pos, src + pos + len);
+      pos += len;
+    } else {
+      uint32_t len = 0;
+      uint32_t offset = 0;
+      if (tag_type == 1) {
+        if (pos >= src_len) {
+          return false;
+        }
+        len = ((tag >> 2) & 0x07) + 4;
+        offset = (static_cast<uint32_t>(tag & 0xE0) << 3) | src[pos++];
+      } else if (tag_type == 2) {
+        if (pos + 2 > src_len) {
+          return false;
+        }
+        len = (tag >> 2) + 1;
+        offset = static_cast<uint32_t>(src[pos]) | (static_cast<uint32_t>(src[pos + 1]) << 8);
+        pos += 2;
+      } else {
+        if (pos + 4 > src_len) {
+          return false;
+        }
+        len = (tag >> 2) + 1;
+        offset = static_cast<uint32_t>(src[pos])
+               | (static_cast<uint32_t>(src[pos + 1]) << 8)
+               | (static_cast<uint32_t>(src[pos + 2]) << 16)
+               | (static_cast<uint32_t>(src[pos + 3]) << 24);
+        pos += 4;
+      }
+      if (offset == 0 || offset > dst.size()) {
+        return false;
+      }
+      size_t copy_pos = dst.size() - offset;
+      for (uint32_t k = 0; k < len; ++k) {
+        dst.push_back(dst[copy_pos + k]);
+      }
+    }
+  }
+  return dst.size() == uncompressed_len;
+}
+
+static bool decode_rle_bit_packed(const uint8_t *buf,
+                                  size_t len,
+                                  uint8_t bit_width,
+                                  size_t num_values,
+                                  std::vector<uint32_t> &out)
+{
+  out.clear();
+  out.reserve(num_values);
+  if (bit_width == 0) {
+    out.assign(num_values, 0);
+    return true;
+  }
+  size_t pos = 0;
+  uint32_t byte_width = (bit_width + 7) / 8;
+  while (out.size() < num_values && pos < len) {
+    uint64_t header = 0;
+    int shift = 0;
+    while (pos < len) {
+      uint8_t b = buf[pos++];
+      header |= static_cast<uint64_t>(b & 0x7F) << shift;
+      if ((b & 0x80) == 0) {
+        break;
+      }
+      shift += 7;
+    }
+    if ((header & 1) == 0) {
+      uint64_t run_len = header >> 1;
+      if (pos + byte_width > len) {
+        return false;
+      }
+      uint32_t val = 0;
+      for (uint32_t k = 0; k < byte_width; ++k) {
+        val |= static_cast<uint32_t>(buf[pos++]) << (8 * k);
+      }
+      for (uint64_t i = 0; i < run_len && out.size() < num_values; ++i) {
+        out.push_back(val);
+      }
+    } else {
+      uint64_t num_groups = header >> 1;
+      uint64_t total_vals = num_groups * 8;
+      uint64_t total_bytes = num_groups * bit_width;
+      if (pos + total_bytes > len) {
+        return false;
+      }
+      uint64_t bit_buf = 0;
+      int bits_in_buf = 0;
+      size_t group_end = pos + static_cast<size_t>(total_bytes);
+      uint32_t mask = (bit_width == 32) ? 0xFFFFFFFFU : ((1U << bit_width) - 1U);
+      for (uint64_t i = 0; i < total_vals && out.size() < num_values; ++i) {
+        while (bits_in_buf < bit_width && pos < group_end) {
+          bit_buf |= static_cast<uint64_t>(buf[pos++]) << bits_in_buf;
+          bits_in_buf += 8;
+        }
+        uint32_t val = static_cast<uint32_t>(bit_buf) & mask;
+        bit_buf >>= bit_width;
+        bits_in_buf -= bit_width;
+        out.push_back(val);
+      }
+      pos = group_end;
+    }
+  }
+  return out.size() == num_values;
+}
+
+struct ParquetSchemaElem
+{
+  int32_t type;
+  int32_t repetition_type;
+  std::string name;
+  int32_t num_children;
+  bool has_type;
+  ParquetSchemaElem() : type(-1), repetition_type(0), name(), num_children(0), has_type(false) {}
+};
+
+struct ParquetColumnChunkMeta
+{
+  int32_t type;
+  int32_t codec;
+  int64_t num_values;
+  int64_t data_page_offset;
+  int64_t dict_page_offset;
+  bool has_dict_offset;
+  ParquetColumnChunkMeta()
+    : type(-1), codec(0), num_values(0), data_page_offset(0), dict_page_offset(0), has_dict_offset(false) {}
+};
+
+static int read_parquet_file(const std::string &path,
+                             const std::vector<NamedOption> &opts,
+                             FileTable &table)
+{
+  int ret = OB_SUCCESS;
+  if (!opts.empty()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "unsupported option in read_parquet");
+    return ret;
+  }
+  std::string content;
+  if (OB_FAIL(read_entire_file(path, content))) {
+    return ret;
+  }
+  if (content.size() < 12
+      || 0 != std::memcmp(content.data(), "PAR1", 4)
+      || 0 != std::memcmp(content.data() + content.size() - 4, "PAR1", 4)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "invalid Parquet file magic");
+    return ret;
+  }
+  const uint8_t *raw = reinterpret_cast<const uint8_t *>(content.data());
+  size_t file_len = content.size();
+  uint32_t footer_len = static_cast<uint32_t>(raw[file_len - 8])
+                      | (static_cast<uint32_t>(raw[file_len - 7]) << 8)
+                      | (static_cast<uint32_t>(raw[file_len - 6]) << 16)
+                      | (static_cast<uint32_t>(raw[file_len - 5]) << 24);
+  if (footer_len == 0 || static_cast<size_t>(footer_len) + 12 > file_len) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "invalid Parquet footer length");
+    return ret;
+  }
+
+  ThriftCompactReader footer(raw + file_len - 8 - footer_len, footer_len);
+  std::vector<ParquetSchemaElem> schema_elems;
+  int64_t total_rows = 0;
+  std::vector<std::vector<ParquetColumnChunkMeta>> row_groups;
+
+  int16_t last_fid = 0;
+  int16_t fid = 0;
+  uint8_t ftype = 0;
+  while (footer.read_field_header(last_fid, fid, ftype)) {
+    if (fid == 2 && ftype == 9) {
+      uint8_t et = 0;
+      uint64_t cnt = 0;
+      if (footer.read_list_header(et, cnt)) {
+        for (uint64_t i = 0; i < cnt && footer.ok(); ++i) {
+          ParquetSchemaElem se;
+          int16_t se_last = 0, se_fid = 0;
+          uint8_t se_ft = 0;
+          while (footer.read_field_header(se_last, se_fid, se_ft)) {
+            if (se_fid == 1 && se_ft == 5) {
+              se.type = static_cast<int32_t>(footer.read_zigzag());
+              se.has_type = true;
+            } else if (se_fid == 3 && se_ft == 5) {
+              se.repetition_type = static_cast<int32_t>(footer.read_zigzag());
+            } else if (se_fid == 4 && se_ft == 8) {
+              se.name = footer.read_binary();
+            } else if (se_fid == 5 && se_ft == 5) {
+              se.num_children = static_cast<int32_t>(footer.read_zigzag());
+            } else {
+              footer.skip_value(se_ft);
+            }
+          }
+          schema_elems.push_back(se);
+        }
+      }
+    } else if (fid == 3 && ftype == 6) {
+      total_rows = footer.read_zigzag();
+    } else if (fid == 4 && ftype == 9) {
+      uint8_t et = 0;
+      uint64_t rg_cnt = 0;
+      if (footer.read_list_header(et, rg_cnt)) {
+        for (uint64_t r = 0; r < rg_cnt && footer.ok(); ++r) {
+          std::vector<ParquetColumnChunkMeta> rg_cols;
+          int16_t rg_last = 0, rg_fid = 0;
+          uint8_t rg_ft = 0;
+          while (footer.read_field_header(rg_last, rg_fid, rg_ft)) {
+            if (rg_fid == 1 && rg_ft == 9) {
+              uint8_t cc_et = 0;
+              uint64_t cc_cnt = 0;
+              if (footer.read_list_header(cc_et, cc_cnt)) {
+                for (uint64_t c = 0; c < cc_cnt && footer.ok(); ++c) {
+                  ParquetColumnChunkMeta cmeta;
+                  int16_t cc_last = 0, cc_fid = 0;
+                  uint8_t cc_ft = 0;
+                  while (footer.read_field_header(cc_last, cc_fid, cc_ft)) {
+                    if (cc_fid == 3 && cc_ft == 12) {
+                      int16_t md_last = 0, md_fid = 0;
+                      uint8_t md_ft = 0;
+                      while (footer.read_field_header(md_last, md_fid, md_ft)) {
+                        if (md_fid == 1 && md_ft == 5) {
+                          cmeta.type = static_cast<int32_t>(footer.read_zigzag());
+                        } else if (md_fid == 4 && md_ft == 5) {
+                          cmeta.codec = static_cast<int32_t>(footer.read_zigzag());
+                        } else if (md_fid == 5 && md_ft == 6) {
+                          cmeta.num_values = footer.read_zigzag();
+                        } else if (md_fid == 9 && md_ft == 6) {
+                          cmeta.data_page_offset = footer.read_zigzag();
+                        } else if (md_fid == 11 && md_ft == 6) {
+                          cmeta.dict_page_offset = footer.read_zigzag();
+                          cmeta.has_dict_offset = true;
+                        } else {
+                          footer.skip_value(md_ft);
+                        }
+                      }
+                    } else {
+                      footer.skip_value(cc_ft);
+                    }
+                  }
+                  rg_cols.push_back(cmeta);
+                }
+              }
+            } else {
+              footer.skip_value(rg_ft);
+            }
+          }
+          row_groups.push_back(rg_cols);
+        }
+      }
+    } else {
+      footer.skip_value(ftype);
+    }
+  }
+
+  if (!footer.ok() || schema_elems.size() < 2) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "invalid Parquet schema metadata");
+    return ret;
+  }
+
+  std::vector<ParquetSchemaElem> leaf_cols;
+  for (size_t i = 1; i < schema_elems.size(); ++i) {
+    if (schema_elems[i].has_type && schema_elems[i].num_children == 0) {
+      leaf_cols.push_back(schema_elems[i]);
+    }
+  }
+  if (leaf_cols.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    return ret;
+  }
+
+  size_t num_cols = leaf_cols.size();
+  table.cols.resize(num_cols);
+  for (size_t j = 0; j < num_cols; ++j) {
+    table.cols[j].name = leaf_cols[j].name;
+    switch (leaf_cols[j].type) {
+      case 0: table.cols[j].type = COL_BOOLEAN; break;
+      case 1:
+      case 2: table.cols[j].type = COL_BIGINT; break;
+      case 4:
+      case 5: table.cols[j].type = COL_DOUBLE; break;
+      case 6:
+      case 7:
+      default: table.cols[j].type = COL_VARCHAR; break;
+    }
+  }
+
+  table.rows.assign(static_cast<size_t>(total_rows), std::vector<FileCell>(num_cols));
+  for (size_t j = 0; j < num_cols; ++j) {
+    size_t row_cursor = 0;
+    for (size_t rg = 0; rg < row_groups.size(); ++rg) {
+      if (j >= row_groups[rg].size()) {
+        ret = OB_INVALID_ARGUMENT;
+        return ret;
+      }
+      const ParquetColumnChunkMeta &cmeta = row_groups[rg][j];
+      size_t page_pos = static_cast<size_t>(cmeta.data_page_offset);
+      if (cmeta.has_dict_offset && cmeta.dict_page_offset > 0 && cmeta.dict_page_offset < cmeta.data_page_offset) {
+        page_pos = static_cast<size_t>(cmeta.dict_page_offset);
+      }
+      int64_t values_decoded = 0;
+      std::vector<std::string> dict_vals;
+      while (values_decoded < cmeta.num_values && page_pos < file_len) {
+        ThriftCompactReader ph(raw + page_pos, file_len - page_pos);
+        int32_t page_type = -1;
+        int32_t uncompressed_size = 0;
+        int32_t compressed_size = 0;
+        int32_t dp_num_values = 0;
+        int32_t dp_encoding = 0;
+        int32_t dp2_def_len = 0;
+        int32_t dp2_rep_len = 0;
+        bool dp2_is_compressed = true;
+        int16_t ph_last = 0, ph_fid = 0;
+        uint8_t ph_ft = 0;
+        while (ph.read_field_header(ph_last, ph_fid, ph_ft)) {
+          if (ph_fid == 1 && ph_ft == 5) {
+            page_type = static_cast<int32_t>(ph.read_zigzag());
+          } else if (ph_fid == 2 && ph_ft == 5) {
+            uncompressed_size = static_cast<int32_t>(ph.read_zigzag());
+          } else if (ph_fid == 3 && ph_ft == 5) {
+            compressed_size = static_cast<int32_t>(ph.read_zigzag());
+          } else if (ph_fid == 5 && ph_ft == 12) {
+            int16_t d_last = 0, d_fid = 0;
+            uint8_t d_ft = 0;
+            while (ph.read_field_header(d_last, d_fid, d_ft)) {
+              if (d_fid == 1 && d_ft == 5) dp_num_values = static_cast<int32_t>(ph.read_zigzag());
+              else if (d_fid == 2 && d_ft == 5) dp_encoding = static_cast<int32_t>(ph.read_zigzag());
+              else ph.skip_value(d_ft);
+            }
+          } else if (ph_fid == 7 && ph_ft == 12) {
+            int16_t d_last = 0, d_fid = 0;
+            uint8_t d_ft = 0;
+            while (ph.read_field_header(d_last, d_fid, d_ft)) {
+              if (d_fid == 1 && d_ft == 5) dp_num_values = static_cast<int32_t>(ph.read_zigzag());
+              else if (d_fid == 2 && d_ft == 5) dp_encoding = static_cast<int32_t>(ph.read_zigzag());
+              else ph.skip_value(d_ft);
+            }
+          } else if (ph_fid == 8 && ph_ft == 12) {
+            int16_t d_last = 0, d_fid = 0;
+            uint8_t d_ft = 0;
+            while (ph.read_field_header(d_last, d_fid, d_ft)) {
+              if (d_fid == 1 && d_ft == 5) dp_num_values = static_cast<int32_t>(ph.read_zigzag());
+              else if (d_fid == 4 && d_ft == 5) dp_encoding = static_cast<int32_t>(ph.read_zigzag());
+              else if (d_fid == 5 && d_ft == 5) dp2_def_len = static_cast<int32_t>(ph.read_zigzag());
+              else if (d_fid == 6 && d_ft == 5) dp2_rep_len = static_cast<int32_t>(ph.read_zigzag());
+              else if (d_fid == 7 && (d_ft == 1 || d_ft == 2)) dp2_is_compressed = (d_ft == 1);
+              else ph.skip_value(d_ft);
+            }
+          } else {
+            ph.skip_value(ph_ft);
+          }
+        }
+        if (!ph.ok() || compressed_size < 0 || uncompressed_size < 0) {
+          ret = OB_INVALID_ARGUMENT;
+          return ret;
+        }
+        size_t payload_start = page_pos + ph.pos();
+        if (payload_start + static_cast<size_t>(compressed_size) > file_len) {
+          ret = OB_INVALID_ARGUMENT;
+          return ret;
+        }
+        page_pos = payload_start + static_cast<size_t>(compressed_size);
+
+        const uint8_t *payload = raw + payload_start;
+        std::vector<uint32_t> def_levels;
+        std::vector<uint8_t> decompressed_vals;
+        const uint8_t *val_ptr = NULL;
+        size_t val_len = 0;
+
+        if (page_type == 3) { // DATA_PAGE_V2
+          if (dp2_rep_len + dp2_def_len > compressed_size) {
+            ret = OB_INVALID_ARGUMENT;
+            return ret;
+          }
+          const uint8_t *def_ptr = payload + dp2_rep_len;
+          if (leaf_cols[j].repetition_type == 1) { // OPTIONAL
+            if (!decode_rle_bit_packed(def_ptr, static_cast<size_t>(dp2_def_len), 1,
+                                       static_cast<size_t>(dp_num_values), def_levels)) {
+              ret = OB_INVALID_ARGUMENT;
+              return ret;
+            }
+          } else {
+            def_levels.assign(static_cast<size_t>(dp_num_values), 1);
+          }
+          const uint8_t *comp_vals = payload + dp2_rep_len + dp2_def_len;
+          size_t comp_vals_len = static_cast<size_t>(compressed_size - dp2_rep_len - dp2_def_len);
+          if (cmeta.codec == 1 && dp2_is_compressed && comp_vals_len > 0) {
+            if (!snappy_decompress(comp_vals, comp_vals_len, decompressed_vals)) {
+              ret = OB_INVALID_ARGUMENT;
+              return ret;
+            }
+            val_ptr = decompressed_vals.data();
+            val_len = decompressed_vals.size();
+          } else if (cmeta.codec == 0 || !dp2_is_compressed) {
+            val_ptr = comp_vals;
+            val_len = comp_vals_len;
+          } else {
+            ret = OB_NOT_SUPPORTED;
+            return ret;
+          }
+        } else if (page_type == 0 || page_type == 2) { // DATA_PAGE v1 or DICTIONARY_PAGE
+          if (cmeta.codec == 1 && compressed_size > 0) {
+            if (!snappy_decompress(payload, static_cast<size_t>(compressed_size), decompressed_vals)) {
+              ret = OB_INVALID_ARGUMENT;
+              return ret;
+            }
+            val_ptr = decompressed_vals.data();
+            val_len = decompressed_vals.size();
+          } else if (cmeta.codec == 0) {
+            val_ptr = payload;
+            val_len = static_cast<size_t>(compressed_size);
+          } else {
+            ret = OB_NOT_SUPPORTED;
+            return ret;
+          }
+          if (page_type == 0) {
+            if (leaf_cols[j].repetition_type == 1) {
+              if (val_len < 4) {
+                ret = OB_INVALID_ARGUMENT;
+                return ret;
+              }
+              uint32_t def_byte_len = static_cast<uint32_t>(val_ptr[0])
+                                    | (static_cast<uint32_t>(val_ptr[1]) << 8)
+                                    | (static_cast<uint32_t>(val_ptr[2]) << 16)
+                                    | (static_cast<uint32_t>(val_ptr[3]) << 24);
+              if (4 + def_byte_len > val_len) {
+                ret = OB_INVALID_ARGUMENT;
+                return ret;
+              }
+              if (!decode_rle_bit_packed(val_ptr + 4, def_byte_len, 1,
+                                         static_cast<size_t>(dp_num_values), def_levels)) {
+                ret = OB_INVALID_ARGUMENT;
+                return ret;
+              }
+              val_ptr += 4 + def_byte_len;
+              val_len -= 4 + def_byte_len;
+            } else {
+              def_levels.assign(static_cast<size_t>(dp_num_values), 1);
+            }
+          }
+        } else {
+          continue;
+        }
+
+        auto read_plain_val = [&](size_t &vpos, std::string &out_str) -> bool {
+          int32_t ptype = leaf_cols[j].type;
+          if (ptype == 1) { // INT32
+            if (vpos + 4 > val_len) return false;
+            int32_t v = static_cast<int32_t>(static_cast<uint32_t>(val_ptr[vpos])
+                      | (static_cast<uint32_t>(val_ptr[vpos + 1]) << 8)
+                      | (static_cast<uint32_t>(val_ptr[vpos + 2]) << 16)
+                      | (static_cast<uint32_t>(val_ptr[vpos + 3]) << 24));
+            vpos += 4;
+            out_str = std::to_string(v);
+            return true;
+          } else if (ptype == 2) { // INT64
+            if (vpos + 8 > val_len) return false;
+            uint64_t u = 0;
+            for (int b = 0; b < 8; ++b) {
+              u |= static_cast<uint64_t>(val_ptr[vpos + b]) << (8 * b);
+            }
+            vpos += 8;
+            out_str = std::to_string(static_cast<int64_t>(u));
+            return true;
+          } else if (ptype == 5) { // DOUBLE
+            if (vpos + 8 > val_len) return false;
+            double d = 0.0;
+            std::memcpy(&d, val_ptr + vpos, 8);
+            vpos += 8;
+            char dbuf[64];
+            std::snprintf(dbuf, sizeof(dbuf), "%.15g", d);
+            out_str = dbuf;
+            return true;
+          } else if (ptype == 6) { // BYTE_ARRAY
+            if (vpos + 4 > val_len) return false;
+            uint32_t blen = static_cast<uint32_t>(val_ptr[vpos])
+                          | (static_cast<uint32_t>(val_ptr[vpos + 1]) << 8)
+                          | (static_cast<uint32_t>(val_ptr[vpos + 2]) << 16)
+                          | (static_cast<uint32_t>(val_ptr[vpos + 3]) << 24);
+            vpos += 4;
+            if (vpos + blen > val_len) return false;
+            out_str.assign(reinterpret_cast<const char *>(val_ptr + vpos), blen);
+            vpos += blen;
+            return true;
+          }
+          return false;
+        };
+
+        if (page_type == 2) { // DICTIONARY_PAGE
+          size_t vpos = 0;
+          dict_vals.clear();
+          for (int32_t idx = 0; idx < dp_num_values; ++idx) {
+            std::string s;
+            if (!read_plain_val(vpos, s)) {
+              ret = OB_INVALID_ARGUMENT;
+              return ret;
+            }
+            dict_vals.push_back(s);
+          }
+          continue;
+        }
+
+        size_t non_null_cnt = 0;
+        for (size_t idx = 0; idx < def_levels.size(); ++idx) {
+          if (def_levels[idx] != 0) {
+            ++non_null_cnt;
+          }
+        }
+
+        std::vector<uint32_t> dict_indices;
+        if (dp_encoding == 2 || dp_encoding == 8) {
+          if (non_null_cnt > 0) {
+            if (val_len < 1) {
+              ret = OB_INVALID_ARGUMENT;
+              return ret;
+            }
+            uint8_t bw = val_ptr[0];
+            if (!decode_rle_bit_packed(val_ptr + 1, val_len - 1, bw, non_null_cnt, dict_indices)) {
+              ret = OB_INVALID_ARGUMENT;
+              return ret;
+            }
+          }
+        }
+
+        size_t vpos = 0;
+        size_t nn_idx = 0;
+        for (int32_t idx = 0; idx < dp_num_values && row_cursor < table.rows.size(); ++idx, ++row_cursor) {
+          if (def_levels[idx] == 0) {
+            table.rows[row_cursor][j].is_null = true;
+            table.cols[j].has_null = true;
+          } else {
+            table.rows[row_cursor][j].is_null = false;
+            if (dp_encoding == 2 || dp_encoding == 8) {
+              uint32_t didx = dict_indices[nn_idx++];
+              if (didx >= dict_vals.size()) {
+                ret = OB_INVALID_ARGUMENT;
+                return ret;
+              }
+              table.rows[row_cursor][j].val = dict_vals[didx];
+            } else if (leaf_cols[j].type == 0) {
+              size_t byte_i = nn_idx / 8;
+              size_t bit_i = nn_idx % 8;
+              if (byte_i >= val_len) {
+                ret = OB_INVALID_ARGUMENT;
+                return ret;
+              }
+              bool b = ((val_ptr[byte_i] >> bit_i) & 1) != 0;
+              table.rows[row_cursor][j].val = b ? "true" : "false";
+              ++nn_idx;
+            } else {
+              if (!read_plain_val(vpos, table.rows[row_cursor][j].val)) {
+                ret = OB_INVALID_ARGUMENT;
+                return ret;
+              }
+              ++nn_idx;
+            }
+          }
+        }
+        values_decoded += dp_num_values;
+      }
+    }
+  }
+  return ret;
+}
+
+static int read_glob_table(const std::string &pattern,
+                           const std::vector<NamedOption> &opts,
+                           FileTable &table)
+{
+  int ret = OB_SUCCESS;
+  if (!opts.empty()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "unsupported option in glob");
+    return ret;
+  }
+  FileColumn col;
+  col.name = "file";
+  col.type = COL_VARCHAR;
+  col.has_null = false;
+  table.cols.push_back(col);
+
+  std::vector<std::string> matched;
+#ifdef _WIN32
+  std::string norm_pat = pattern;
+  for (size_t i = 0; i < norm_pat.size(); ++i) {
+    if (norm_pat[i] == '\\') norm_pat[i] = '/';
+  }
+  std::string dir_prefix;
+  size_t last_slash = norm_pat.rfind('/');
+  if (last_slash != std::string::npos) {
+    dir_prefix = norm_pat.substr(0, last_slash + 1);
+  }
+  struct _finddata_t fdata;
+  intptr_t h = _findfirst(pattern.c_str(), &fdata);
+  if (h != -1) {
+    do {
+      if (0 != std::strcmp(fdata.name, ".") && 0 != std::strcmp(fdata.name, "..")) {
+        matched.push_back(dir_prefix + fdata.name);
+      }
+    } while (_findnext(h, &fdata) == 0);
+    _findclose(h);
+  }
+#else
+  glob_t gres;
+  std::memset(&gres, 0, sizeof(gres));
+  int grc = ::glob(pattern.c_str(), 0, NULL, &gres);
+  if (grc == 0) {
+    for (size_t i = 0; i < gres.gl_pathc; ++i) {
+      if (NULL != gres.gl_pathv[i]) {
+        matched.push_back(gres.gl_pathv[i]);
+      }
+    }
+  }
+  ::globfree(&gres);
+#endif
+  std::sort(matched.begin(), matched.end());
+  for (size_t i = 0; i < matched.size(); ++i) {
+    std::vector<FileCell> row(1);
+    row[0].is_null = false;
+    row[0].val = matched[i];
+    table.rows.push_back(row);
+  }
+  if (table.rows.empty()) {
+    table.cols[0].has_null = true;
+  }
+  return ret;
+}
+
+static int load_file_table_func(const std::string &func_name_low,
+                                const std::string &args_str,
+                                FileTable &table)
+{
+  int ret = OB_SUCCESS;
+  std::string path;
+  std::vector<NamedOption> opts;
+  if (OB_FAIL(parse_table_func_args(args_str, path, opts))) {
+    return ret;
+  }
+  if (func_name_low == "read_csv") {
+    return read_csv_file(path, opts, table);
+  } else if (func_name_low == "read_json") {
+    return read_json_file(path, opts, table);
+  } else if (func_name_low == "read_parquet") {
+    return read_parquet_file(path, opts, table);
+  } else if (func_name_low == "glob") {
+    return read_glob_table(path, opts, table);
+  }
+  return OB_NOT_SUPPORTED;
+}
+
+static void build_table_subquery_sql(const FileTable &table, std::string &out_sql)
+{
+  out_sql.clear();
+  out_sql.push_back('(');
+  if (table.rows.empty()) {
+    out_sql.append("SELECT ");
+    for (size_t j = 0; j < table.cols.size(); ++j) {
+      if (j > 0) {
+        out_sql.append(", ");
+      }
+      FileCell null_cell;
+      null_cell.is_null = true;
+      out_sql.append(format_cell_sql_expr(null_cell, table.cols[j].type));
+      out_sql.append(" AS ");
+      out_sql.append(escape_sql_ident(table.cols[j].name));
+    }
+    out_sql.append(" FROM DUAL WHERE 1=0");
+  } else {
+    for (size_t r = 0; r < table.rows.size(); ++r) {
+      if (r == 0) {
+        out_sql.append("SELECT ");
+      } else {
+        out_sql.append(" UNION ALL SELECT ");
+      }
+      for (size_t j = 0; j < table.cols.size(); ++j) {
+        if (j > 0) {
+          out_sql.append(", ");
+        }
+        out_sql.append(format_cell_sql_expr(table.rows[r][j], table.cols[j].type));
+        if (r == 0) {
+          out_sql.append(" AS ");
+          out_sql.append(escape_sql_ident(table.cols[j].name));
+        }
+      }
+    }
+  }
+  out_sql.push_back(')');
+}
+
+static void build_describe_sql(const FileTable &table, std::string &out_sql)
+{
+  out_sql.clear();
+  for (size_t j = 0; j < table.cols.size(); ++j) {
+    if (j == 0) {
+      out_sql.append("SELECT ");
+      out_sql.append(escape_sql_string(table.cols[j].name)).append(" AS `column_name`, ");
+      out_sql.append(escape_sql_string(col_type_to_describe_name(table.cols[j].type))).append(" AS `column_type`, ");
+      out_sql.append(table.cols[j].has_null ? "'YES'" : "'NO'").append(" AS `null`, ");
+      out_sql.append("CAST(NULL AS CHAR(64)) AS `key`, ");
+      out_sql.append("CAST(NULL AS CHAR(64)) AS `default`, ");
+      out_sql.append("CAST(NULL AS CHAR(64)) AS `extra`");
+    } else {
+      out_sql.append(" UNION ALL SELECT ");
+      out_sql.append(escape_sql_string(table.cols[j].name)).append(", ");
+      out_sql.append(escape_sql_string(col_type_to_describe_name(table.cols[j].type))).append(", ");
+      out_sql.append(table.cols[j].has_null ? "'YES'" : "'NO'").append(", ");
+      out_sql.append("CAST(NULL AS CHAR(64)), CAST(NULL AS CHAR(64)), CAST(NULL AS CHAR(64))");
+    }
+  }
+}
+
+static bool is_sql_clause_keyword(const std::string &w_low)
+{
+  static const char *const kw[] = {
+    "where", "group", "having", "order", "limit", "offset", "fetch",
+    "union", "intersect", "except", "minus", "join", "inner", "left",
+    "right", "full", "cross", "natural", "straight_join", "on", "using",
+    "into", "for", "lock", "window", "partition", "procedure"
+  };
+  for (size_t i = 0; i < sizeof(kw) / sizeof(kw[0]); ++i) {
+    if (w_low == kw[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool find_matching_paren(const std::string &s, size_t open_pos, size_t &close_pos)
+{
+  if (open_pos >= s.size() || s[open_pos] != '(') {
+    return false;
+  }
+  int depth = 0;
+  char in_quote = 0;
+  for (size_t i = open_pos; i < s.size(); ++i) {
+    char c = s[i];
+    if (in_quote != 0) {
+      if (c == '\\' && i + 1 < s.size()) {
+        ++i;
+      } else if (c == in_quote) {
+        if (i + 1 < s.size() && s[i + 1] == in_quote) {
+          ++i;
+        } else {
+          in_quote = 0;
+        }
+      }
+    } else {
+      if (c == '\'' || c == '"' || c == '`') {
+        in_quote = c;
+      } else if (c == '(') {
+        ++depth;
+      } else if (c == ')') {
+        --depth;
+        if (depth == 0) {
+          close_pos = i;
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+static bool is_file_table_func_name(const std::string &w_low)
+{
+  return w_low == "read_csv" || w_low == "read_json" || w_low == "read_parquet" || w_low == "glob";
+}
+
+struct FileFuncMatch
+{
+  size_t start_pos;
+  size_t open_paren_pos;
+  size_t close_paren_pos;
+  std::string func_name_low;
+  std::string args_str;
+};
+
+static int find_file_table_func_calls(const std::string &sql,
+                                      std::vector<FileFuncMatch> &matches)
+{
+  int ret = OB_SUCCESS;
+  matches.clear();
+  char in_quote = 0;
+  size_t i = 0;
+  while (i < sql.size()) {
+    char c = sql[i];
+    if (in_quote != 0) {
+      if (c == '\\' && in_quote != '`' && i + 1 < sql.size()) {
+        i += 2;
+      } else if (c == in_quote) {
+        if (i + 1 < sql.size() && sql[i + 1] == in_quote) {
+          i += 2;
+        } else {
+          in_quote = 0;
+          ++i;
+        }
+      } else {
+        ++i;
+      }
+      continue;
+    }
+    if (c == '\'' || c == '"' || c == '`') {
+      in_quote = c;
+      ++i;
+      continue;
+    }
+    if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
+      size_t w_start = i;
+      while (i < sql.size() && is_ident_char(sql[i])) {
+        ++i;
+      }
+      std::string word_low = str_tolower(sql.substr(w_start, i - w_start));
+      if (is_file_table_func_name(word_low)) {
+        size_t j = i;
+        while (j < sql.size() && std::isspace(static_cast<unsigned char>(sql[j]))) {
+          ++j;
+        }
+        if (j < sql.size() && sql[j] == '(') {
+          size_t close_p = 0;
+          if (!find_matching_paren(sql, j, close_p)) {
+            ret = OB_ERR_PARSE_SQL;
+            LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
+                           static_cast<int>(sql.size() - w_start), sql.c_str() + w_start, 1);
+            return ret;
+          }
+          FileFuncMatch m;
+          m.start_pos = w_start;
+          m.open_paren_pos = j;
+          m.close_paren_pos = close_p;
+          m.func_name_low = word_low;
+          m.args_str = sql.substr(j + 1, close_p - j - 1);
+          matches.push_back(m);
+          i = close_p + 1;
+          continue;
+        }
+      }
+      continue;
+    }
+    ++i;
+  }
+  return ret;
+}
+
+struct CopyOptions
+{
+  std::string inner_sql;
+  std::string file_path;
+  bool has_header;
+  char delim;
+  char quote;
+  std::string nullstr;
+  CopyOptions() : inner_sql(), file_path(), has_header(false), delim(','), quote('"'), nullstr("") {}
+};
+
+static bool starts_with_copy_stmt(const std::string &sql)
+{
+  size_t i = 0;
+  while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) {
+    ++i;
+  }
+  if (i + 4 > sql.size() || 0 != STRNCASECMP(sql.c_str() + i, "copy", 4)) {
+    return false;
+  }
+  i += 4;
+  while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) {
+    ++i;
+  }
+  return i < sql.size() && sql[i] == '(';
+}
+
+static bool starts_with_describe_select(const std::string &sql)
+{
+  size_t i = 0;
+  while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) {
+    ++i;
+  }
+  size_t w_start = i;
+  while (i < sql.size() && std::isalpha(static_cast<unsigned char>(sql[i]))) {
+    ++i;
+  }
+  std::string w1 = str_tolower(sql.substr(w_start, i - w_start));
+  if (w1 != "describe" && w1 != "desc") {
+    return false;
+  }
+  while (i < sql.size() && (std::isspace(static_cast<unsigned char>(sql[i])) || sql[i] == '(')) {
+    ++i;
+  }
+  size_t w2_start = i;
+  while (i < sql.size() && std::isalpha(static_cast<unsigned char>(sql[i]))) {
+    ++i;
+  }
+  std::string w2 = str_tolower(sql.substr(w2_start, i - w2_start));
+  return w2 == "select";
+}
+
+static int parse_copy_stmt(const std::string &sql, CopyOptions &out_opts)
+{
+  int ret = OB_SUCCESS;
+  size_t i = 0;
+  while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) {
+    ++i;
+  }
+  i += 4; // skip COPY
+  while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) {
+    ++i;
+  }
+  size_t close_query_paren = 0;
+  if (i >= sql.size() || sql[i] != '(' || !find_matching_paren(sql, i, close_query_paren)) {
+    ret = OB_ERR_PARSE_SQL;
+    LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
+                   static_cast<int>(sql.size()), sql.c_str(), 1);
+    return ret;
+  }
+  out_opts.inner_sql = str_trim(sql.substr(i + 1, close_query_paren - i - 1));
+  i = close_query_paren + 1;
+  while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) {
+    ++i;
+  }
+  if (i + 2 > sql.size() || 0 != STRNCASECMP(sql.c_str() + i, "to", 2)
+      || (i + 2 < sql.size() && is_ident_char(sql[i + 2]))) {
+    ret = OB_ERR_PARSE_SQL;
+    LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
+                   static_cast<int>(sql.size() - i), sql.c_str() + i, 1);
+    return ret;
+  }
+  i += 2;
+  while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) {
+    ++i;
+  }
+  if (i >= sql.size() || (sql[i] != '\'' && sql[i] != '"')) {
+    ret = OB_ERR_PARSE_SQL;
+    LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
+                   static_cast<int>(sql.size() - i), sql.c_str() + i, 1);
+    return ret;
+  }
+  char q = sql[i];
+  size_t q_end = i + 1;
+  while (q_end < sql.size()) {
+    if (sql[q_end] == '\\' && q_end + 1 < sql.size()) {
+      q_end += 2;
+    } else if (sql[q_end] == q) {
+      if (q_end + 1 < sql.size() && sql[q_end + 1] == q) {
+        q_end += 2;
+      } else {
+        break;
+      }
+    } else {
+      ++q_end;
+    }
+  }
+  if (q_end >= sql.size()) {
+    ret = OB_ERR_PARSE_SQL;
+    return ret;
+  }
+  bool was_quoted = false;
+  (void)unquote_sql_literal(sql.substr(i, q_end - i + 1), out_opts.file_path, was_quoted);
+  i = q_end + 1;
+  while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) {
+    ++i;
+  }
+  if (i < sql.size() && sql[i] == '(') {
+    size_t close_opt_paren = 0;
+    if (!find_matching_paren(sql, i, close_opt_paren)) {
+      ret = OB_ERR_PARSE_SQL;
+      return ret;
+    }
+    std::string opts_raw = sql.substr(i + 1, close_opt_paren - i - 1);
+    size_t p_start = 0;
+    char in_q = 0;
+    std::vector<std::string> opt_items;
+    for (size_t k = 0; k < opts_raw.size(); ++k) {
+      if (in_q != 0) {
+        if (opts_raw[k] == '\\' && k + 1 < opts_raw.size()) ++k;
+        else if (opts_raw[k] == in_q) {
+          if (k + 1 < opts_raw.size() && opts_raw[k + 1] == in_q) ++k;
+          else in_q = 0;
+        }
+      } else {
+        if (opts_raw[k] == '\'' || opts_raw[k] == '"') in_q = opts_raw[k];
+        else if (opts_raw[k] == ',') {
+          opt_items.push_back(str_trim(opts_raw.substr(p_start, k - p_start)));
+          p_start = k + 1;
+        }
+      }
+    }
+    std::string tail_item = str_trim(opts_raw.substr(p_start));
+    if (!tail_item.empty()) {
+      opt_items.push_back(tail_item);
+    }
+    for (size_t idx = 0; idx < opt_items.size(); ++idx) {
+      const std::string &item = opt_items[idx];
+      size_t p = 0;
+      while (p < item.size() && is_ident_char(item[p])) {
+        ++p;
+      }
+      std::string k_low = str_tolower(item.substr(0, p));
+      while (p < item.size() && (std::isspace(static_cast<unsigned char>(item[p])) || item[p] == '=')) {
+        ++p;
+      }
+      std::string v_raw = str_trim(item.substr(p));
+      std::string v_unq;
+      bool v_q = false;
+      (void)unquote_sql_literal(v_raw, v_unq, v_q);
+      std::string v_low = str_tolower(v_unq);
+      if (k_low == "format") {
+        if (v_low != "csv") {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "unsupported format in COPY TO");
+          return ret;
+        }
+      } else if (k_low == "header") {
+        if (v_low.empty() || v_low == "true" || v_low == "1") {
+          out_opts.has_header = true;
+        } else if (v_low == "false" || v_low == "0") {
+          out_opts.has_header = false;
+        } else {
+          ret = OB_NOT_SUPPORTED;
+          return ret;
+        }
+      } else if (k_low == "nullstr" || k_low == "null") {
+        out_opts.nullstr = v_unq;
+      } else if (k_low == "delimiter" || k_low == "delim" || k_low == "sep") {
+        if (v_unq.size() != 1) {
+          ret = OB_NOT_SUPPORTED;
+          return ret;
+        }
+        out_opts.delim = v_unq[0];
+      } else if (k_low == "quote") {
+        if (v_unq.size() != 1) {
+          ret = OB_NOT_SUPPORTED;
+          return ret;
+        }
+        out_opts.quote = v_unq[0];
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "unsupported option in COPY TO");
+        return ret;
+      }
+    }
+  }
+  return ret;
+}
+
+static void write_csv_escaped_field(std::FILE *fp,
+                                    const std::string &s,
+                                    char delim,
+                                    char quote,
+                                    const std::string &nullstr)
+{
+  bool need_quote = false;
+  if (s == "NULL" || (!nullstr.empty() && s == nullstr)) {
+    need_quote = true;
+  }
+  for (size_t i = 0; i < s.size() && !need_quote; ++i) {
+    if (s[i] == delim || s[i] == quote || s[i] == '\n' || s[i] == '\r') {
+      need_quote = true;
+    }
+  }
+  if (!need_quote) {
+    if (!s.empty()) {
+      std::fwrite(s.data(), 1, s.size(), fp);
+    }
+  } else {
+    std::fputc(quote, fp);
+    for (size_t i = 0; i < s.size(); ++i) {
+      if (s[i] == quote) {
+        std::fputc(quote, fp);
+      }
+      std::fputc(s[i], fp);
+    }
+    std::fputc(quote, fp);
+  }
+}
+
+static int write_result_set_to_csv(ObResultSet &rs,
+                                   ObSQLSessionInfo &session,
+                                   const CopyOptions &copy_opts)
+{
+  int ret = OB_SUCCESS;
+  std::FILE *fp = std::fopen(copy_opts.file_path.c_str(), "wb");
+  if (NULL == fp) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "cannot open output file in COPY TO");
+    return ret;
+  }
+  const ColumnsFieldIArray *fields = rs.get_field_columns();
+  if (copy_opts.has_header && NULL != fields) {
+    for (int64_t j = 0; j < fields->count(); ++j) {
+      if (j > 0) {
+        std::fputc(copy_opts.delim, fp);
+      }
+      const ObString &cname = fields->at(j).cname_;
+      std::string cname_str(cname.ptr(), static_cast<size_t>(cname.length()));
+      write_csv_escaped_field(fp, cname_str, copy_opts.delim, copy_opts.quote, copy_opts.nullstr);
+    }
+    std::fputc('\n', fp);
+  }
+  ObObjPrintParams print_params;
+  print_params.tz_info_ = session.get_timezone_info();
+  print_params.use_memcpy_ = true;
+  print_params.cs_type_ = CS_TYPE_UTF8MB4_GENERAL_CI;
+
+  const ObNewRow *row = NULL;
+  char cell_buf[16384];
+  while (OB_SUCC(ret) && OB_SUCC(rs.get_next_row(row))) {
+    if (OB_ISNULL(row)) {
+      ret = OB_ERR_UNEXPECTED;
+      break;
+    }
+    for (int64_t j = 0; j < row->get_count(); ++j) {
+      if (j > 0) {
+        std::fputc(copy_opts.delim, fp);
+      }
+      const ObObj &cell = row->get_cell(j);
+      if (cell.is_null()) {
+        if (!copy_opts.nullstr.empty()) {
+          std::fwrite(copy_opts.nullstr.data(), 1, copy_opts.nullstr.size(), fp);
+        }
+      } else if (cell.is_string_type()) {
+        ObString s = cell.get_string();
+        std::string val_str(NULL != s.ptr() ? s.ptr() : "", static_cast<size_t>(s.length()));
+        write_csv_escaped_field(fp, val_str, copy_opts.delim, copy_opts.quote, copy_opts.nullstr);
+      } else {
+        int64_t pos = 0;
+        if (OB_FAIL(cell.print_plain_str_literal(cell_buf, sizeof(cell_buf), pos, print_params))) {
+          break;
+        }
+        std::string val_str(cell_buf, static_cast<size_t>(pos));
+        write_csv_escaped_field(fp, val_str, copy_opts.delim, copy_opts.quote, copy_opts.nullstr);
+      }
+    }
+    std::fputc('\n', fp);
+  }
+  if (OB_ITER_END == ret) {
+    ret = OB_SUCCESS;
+  }
+  std::fflush(fp);
+  std::fclose(fp);
+  return ret;
+}
+
+static int rewrite_select_file_funcs(const std::string &sql, std::string &rewritten_sql)
+{
+  int ret = OB_SUCCESS;
+  std::vector<FileFuncMatch> matches;
+  if (OB_FAIL(find_file_table_func_calls(sql, matches))) {
+    return ret;
+  }
+  rewritten_sql.clear();
+  size_t last_idx = 0;
+  for (size_t idx = 0; idx < matches.size(); ++idx) {
+    const FileFuncMatch &m = matches[idx];
+    rewritten_sql.append(sql, last_idx, m.start_pos - last_idx);
+    FileTable tbl;
+    if (OB_FAIL(load_file_table_func(m.func_name_low, m.args_str, tbl))) {
+      return ret;
+    }
+    std::string subq;
+    build_table_subquery_sql(tbl, subq);
+    rewritten_sql.append(subq);
+
+    size_t after_pos = m.close_paren_pos + 1;
+    while (after_pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[after_pos]))) {
+      ++after_pos;
+    }
+    bool need_auto_alias = false;
+    if (after_pos >= sql.size()
+        || sql[after_pos] == ';'
+        || sql[after_pos] == ','
+        || sql[after_pos] == ')') {
+      need_auto_alias = true;
+    } else if (std::isalpha(static_cast<unsigned char>(sql[after_pos])) || sql[after_pos] == '_') {
+      size_t kw_end = after_pos;
+      while (kw_end < sql.size() && is_ident_char(sql[kw_end])) {
+        ++kw_end;
+      }
+      std::string next_word = str_tolower(sql.substr(after_pos, kw_end - after_pos));
+      if (is_sql_clause_keyword(next_word)) {
+        need_auto_alias = true;
+      }
+    }
+    if (need_auto_alias) {
+      rewritten_sql.append(" AS `__file_sql_t").append(std::to_string(idx + 1)).append("`");
+    }
+    last_idx = m.close_paren_pos + 1;
+  }
+  rewritten_sql.append(sql, last_idx, sql.size() - last_idx);
+  return ret;
+}
+
+} // namespace file_sql
+
 OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, ObResultSet &result)
 {
   int ret = OB_SUCCESS;
@@ -1950,6 +4460,80 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
   bool use_plan_cache = session.get_local_ob_enable_plan_cache();
   ObPlanCacheCtx *pc_ctx = NULL;
   bool is_begin_commit_stmt = false;
+  bool is_file_sql_rewritten = false;
+
+  if (OB_SUCC(ret) && !trimed_stmt.empty()) {
+    std::string raw_sql(trimed_stmt.ptr(), static_cast<size_t>(trimed_stmt.length()));
+    bool is_copy = file_sql::starts_with_copy_stmt(raw_sql);
+    bool is_desc_select = file_sql::starts_with_describe_select(raw_sql);
+    std::vector<file_sql::FileFuncMatch> func_matches;
+    int find_ret = file_sql::find_file_table_func_calls(raw_sql, func_matches);
+    if (is_copy || is_desc_select || OB_FAIL(find_ret) || !func_matches.empty()) {
+      ectx.set_need_disconnect(false);
+      int64_t enable_file_sql = 0;
+      if (OB_FAIL(session.get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enable_file_sql))) {
+      } else if (0 == enable_file_sql) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "File SQL when enable_file_sql is disabled");
+      } else if (OB_FAIL(find_ret)) {
+        ret = find_ret;
+      } else if (is_copy) {
+        file_sql::CopyOptions copy_opts;
+        if (OB_FAIL(file_sql::parse_copy_stmt(raw_sql, copy_opts))) {
+        } else {
+          ObArenaAllocator copy_alloc(ObModIds::OB_SQL_EXECUTOR, OB_MALLOC_NORMAL_BLOCK_SIZE);
+          ObResultSet *inner_rs = OB_NEWx(ObResultSet, (&copy_alloc), session, copy_alloc, *plan_cache_access_service_);
+          if (OB_ISNULL(inner_rs)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else {
+            {
+              LinkExecCtxGuard inner_guard(session, inner_rs->get_exec_context());
+              ObSqlCtx inner_ctx = context;
+              ObString inner_sql_str(static_cast<int32_t>(copy_opts.inner_sql.size()), copy_opts.inner_sql.c_str());
+              if (OB_FAIL(inner_rs->init())) {
+              } else if (OB_FAIL(this->handle_text_query(inner_sql_str, inner_ctx, *inner_rs))) {
+              } else if (OB_FAIL(inner_rs->open())) {
+                int cli_ret = OB_SUCCESS;
+                (void)inner_rs->close(cli_ret);
+              } else {
+                ret = file_sql::write_result_set_to_csv(*inner_rs, session, copy_opts);
+                int close_ret = inner_rs->close();
+                if (OB_SUCC(ret) && OB_FAIL(close_ret)) {
+                  ret = close_ret;
+                }
+              }
+            }
+            inner_rs->~ObResultSet();
+          }
+          if (OB_SUCC(ret)) {
+            const char *noop_sql = "SET @@session.enable_file_sql = @@session.enable_file_sql";
+            if (OB_FAIL(ob_write_string(allocator, ObString::make_string(noop_sql), trimed_stmt))) {
+            } else {
+              is_file_sql_rewritten = true;
+            }
+          }
+        }
+      } else if (is_desc_select && !func_matches.empty()) {
+        file_sql::FileTable tbl;
+        std::string desc_sql;
+        if (OB_FAIL(file_sql::load_file_table_func(func_matches[0].func_name_low, func_matches[0].args_str, tbl))) {
+        } else {
+          file_sql::build_describe_sql(tbl, desc_sql);
+          if (OB_FAIL(ob_write_string(allocator, ObString(static_cast<int32_t>(desc_sql.size()), desc_sql.c_str()), trimed_stmt))) {
+          } else {
+            is_file_sql_rewritten = true;
+          }
+        }
+      } else if (!func_matches.empty()) {
+        std::string rewritten_sql;
+        if (OB_FAIL(file_sql::rewrite_select_file_funcs(raw_sql, rewritten_sql))) {
+        } else if (OB_FAIL(ob_write_string(allocator, ObString(static_cast<int32_t>(rewritten_sql.size()), rewritten_sql.c_str()), trimed_stmt))) {
+        } else {
+          is_file_sql_rewritten = true;
+        }
+      }
+    }
+  }
 
   if (OB_FAIL(ret)) {
     // do nothing
@@ -1983,6 +4567,8 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
                                       OB_MOCK_DEFAULT_DATABASE_ID:
                                       database_id)) {
       // do nothing
+    } else if (is_file_sql_rewritten) {
+      // Skip plan cache lookup and force direct compilation for rewritten File SQL queries
     } else if (!use_plan_cache) {
       if (context.multi_stmt_item_.is_batched_multi_stmt()) {
         ret = OB_BATCHED_MULTI_STMT_ROLLBACK;
