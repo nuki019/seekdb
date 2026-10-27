@@ -20,7 +20,7 @@
 #include "lib/allocator/page_arena.h"
 #include "lib/hash/ob_hashset.h"
 #include "common/datum/ob_datum.h"
-#include "storage/blocksstable/ob_datum_row.h"
+#include "data_plane/blocksstable/ob_datum_row.h"
 #include "sql/das/ob_das_dml_ctx_define.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "data_plane/fts/ob_fts_doc_word_scan.h"

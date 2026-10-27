@@ -38,6 +38,7 @@
 #include "sql/monitor/show_trace/ob_show_trace.h"
 #include "sql/optimizer/ob_optimizer.h"
 #include "share/rc/ob_server_runtime.h"
+#include "share/rc/ob_context.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2376,7 +2377,7 @@ static int parse_table_func_args(const std::string &args_str,
     return ret;
   }
   bool first_quoted = false;
-  if (!unquote_sql_literal(parts[0], out_path, first_quoted) || !first_quoted || parts[0].find('=') != std::string::npos && !first_quoted) {
+  if (!unquote_sql_literal(parts[0], out_path, first_quoted) || !first_quoted || (parts[0].find('=') != std::string::npos && !first_quoted)) {
     ret = OB_ERR_PARSE_SQL;
     LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
                    static_cast<int>(parts[0].size()), parts[0].c_str(), 1);
@@ -4704,6 +4705,8 @@ static int proxy_exec_read(const std::string &sql, int64_t num_cols, std::vector
   return ret;
 }
 
+static void ensure_ai_worker_started();
+
 static int ensure_metadata_tables_exist()
 {
   if (g_ai_meta_tables_ready.load(std::memory_order_acquire)) {
@@ -4742,6 +4745,7 @@ static int ensure_metadata_tables_exist()
   }
   if (OB_SUCC(ret)) {
     g_ai_meta_tables_ready.store(true, std::memory_order_release);
+    ensure_ai_worker_started();
   }
   return ret;
 }
@@ -5165,20 +5169,26 @@ static void ai_worker_process_once()
 
 static void ai_worker_loop()
 {
+  static const uint64_t PROCESS_OWNER_ID = 1;
   while (true) {
     int ret = OB_SUCCESS;
     std::this_thread::sleep_for(std::chrono::milliseconds(40));
-    if (OB_ISNULL(GCTX.sql_proxy_) || !GCTX.sql_proxy_->is_inited()) {
+    if (!g_ai_meta_tables_ready.load(std::memory_order_acquire)
+        || OB_ISNULL(GCTX.sql_proxy_)
+        || !GCTX.sql_proxy_->is_inited()) {
       continue;
     }
     SERVER_MODULE_SCOPE {
-      lib::ContextParam param;
-      param.set_mem_attr("AIColWorker", ObCtxIds::DEFAULT_CTX_ID)
-        .set_properties(lib::USE_TL_PAGE_OPTIONAL)
-        .set_page_size(OB_MALLOC_BIG_BLOCK_SIZE);
-      CREATE_WITH_TEMP_CONTEXT(param) {
-        THIS_WORKER.set_timeout_ts(ObTimeUtility::current_time() + 60LL * 1000000LL);
-        ai_worker_process_once();
+      CREATE_WITH_TEMP_ENTITY(RESOURCE_OWNER, PROCESS_OWNER_ID) {
+        lib::ContextTLOptGuard tl_guard(true);
+        lib::ContextParam param;
+        param.set_mem_attr("AIColWorker", ObCtxIds::DEFAULT_CTX_ID)
+          .set_properties(lib::USE_TL_PAGE_OPTIONAL)
+          .set_page_size(OB_MALLOC_BIG_BLOCK_SIZE);
+        CREATE_WITH_TEMP_CONTEXT(param) {
+          THIS_WORKER.set_timeout_ts(ObTimeUtility::current_time() + 60LL * 1000000LL);
+          ai_worker_process_once();
+        }
       }
     }
   }
@@ -5690,7 +5700,7 @@ static int handle_create_table_ai_column(ObSql *sql_engine,
 {
   handled = false;
   if (find_top_level_keyword_pair(raw_sql, "create", "table") != 0
-      || raw_sql.find("AI COLUMN") == std::string::npos && str_tolower(raw_sql).find("ai column") == std::string::npos) {
+      || (raw_sql.find("AI COLUMN") == std::string::npos && str_tolower(raw_sql).find("ai column") == std::string::npos)) {
     return OB_SUCCESS;
   }
   size_t open_paren = raw_sql.find('(');
@@ -6544,7 +6554,9 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
     }
 
     if (OB_SUCC(ret) && !is_file_sql_rewritten && !ai_column::g_in_ai_column_internal && !session.is_inner()) {
-      ai_column::ensure_ai_worker_started();
+      if (ai_column::g_ai_meta_tables_ready.load(std::memory_order_acquire)) {
+        ai_column::ensure_ai_worker_started();
+      }
       ObString db_obstr = session.get_database_name();
       std::string default_db(db_obstr.ptr() != NULL ? db_obstr.ptr() : "",
                              db_obstr.ptr() != NULL ? static_cast<size_t>(db_obstr.length()) : 0);
