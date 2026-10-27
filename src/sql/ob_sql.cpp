@@ -2670,7 +2670,8 @@ struct SimpleJsonValue
   Kind kind;
   std::string str_val;
   std::vector<std::pair<std::string, SimpleJsonValue>> obj_fields;
-  SimpleJsonValue() : kind(J_NULL), str_val(), obj_fields() {}
+  std::vector<SimpleJsonValue> arr_elems;
+  SimpleJsonValue() : kind(J_NULL), str_val(), obj_fields(), arr_elems() {}
 };
 
 class SimpleJsonParser
@@ -2901,6 +2902,7 @@ public:
       if (!parse_value(elem)) {
         return false;
       }
+      out.arr_elems.push_back(elem);
       skip_ws();
       if (pos_ < len_ && p_[pos_] == ',') {
         ++pos_;
@@ -2957,25 +2959,44 @@ static int read_json_file(const std::string &path,
   }
 
   std::vector<SimpleJsonValue> objects;
-  size_t line_start = 0;
-  while (line_start < content.size()) {
-    size_t line_end = content.find('\n', line_start);
-    if (line_end == std::string::npos) {
-      line_end = content.size();
-    }
-    std::string line = str_trim(content.substr(line_start, line_end - line_start));
-    line_start = line_end + 1;
-    if (line.empty()) {
-      continue;
-    }
-    SimpleJsonParser parser(line.c_str(), line.size());
-    SimpleJsonValue jval;
-    if (!parser.parse_value(jval) || !parser.eof() || jval.kind != SimpleJsonValue::J_OBJ) {
+  std::string trimmed_content = str_trim(content);
+  if (!trimmed_content.empty() && trimmed_content.front() == '[' && format != "newline_delimited" && format != "ndjson") {
+    SimpleJsonParser parser(trimmed_content.c_str(), trimmed_content.size());
+    SimpleJsonValue jarr;
+    if (!parser.parse_value(jarr) || !parser.eof() || jarr.kind != SimpleJsonValue::J_ARR) {
       ret = OB_INVALID_ARGUMENT;
-      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "invalid JSON object line");
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "invalid JSON array");
       return ret;
     }
-    objects.push_back(jval);
+    for (size_t i = 0; i < jarr.arr_elems.size(); ++i) {
+      if (jarr.arr_elems[i].kind != SimpleJsonValue::J_OBJ) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "JSON array element is not an object");
+        return ret;
+      }
+      objects.push_back(jarr.arr_elems[i]);
+    }
+  } else {
+    size_t line_start = 0;
+    while (line_start < content.size()) {
+      size_t line_end = content.find('\n', line_start);
+      if (line_end == std::string::npos) {
+        line_end = content.size();
+      }
+      std::string line = str_trim(content.substr(line_start, line_end - line_start));
+      line_start = line_end + 1;
+      if (line.empty()) {
+        continue;
+      }
+      SimpleJsonParser parser(line.c_str(), line.size());
+      SimpleJsonValue jval;
+      if (!parser.parse_value(jval) || !parser.eof() || jval.kind != SimpleJsonValue::J_OBJ) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "invalid JSON object line");
+        return ret;
+      }
+      objects.push_back(jval);
+    }
   }
 
   if (objects.empty()) {
@@ -6249,16 +6270,19 @@ static int handle_dml_ai_column(ObSql *sql_engine,
       if (OB_FAIL(ret = exec_session_sql(sql_engine, pc_service, session, context, upd_sql))) {
         return ret;
       }
+      std::string task_sql =
+          "REPLACE INTO oceanbase.__all_ai_column_task "
+          "(table_id, column_id, rowkey_predicate, request_id, state, retry_count, eligible_ts) VALUES ";
       for (size_t ci = 0; ci < ai_cols.size(); ++ci) {
-        const AiColumnMeta &m = ai_cols[ci];
-        std::string task_sql =
-            "REPLACE INTO oceanbase.__all_ai_column_task "
-            "(table_id, column_id, rowkey_predicate, request_id, state, retry_count, eligible_ts) VALUES ("
-            + std::to_string(m.table_id) + ", " + std::to_string(m.column_id) + ", '"
-            + sql_escape(rpred) + "', " + std::to_string(req_id) + ", 1, 0, NOW(6))";
-        if (OB_FAIL(ret = exec_session_sql(sql_engine, pc_service, session, context, task_sql))) {
-          return ret;
+        if (ci > 0) {
+          task_sql += ", ";
         }
+        const AiColumnMeta &m = ai_cols[ci];
+        task_sql += "(" + std::to_string(m.table_id) + ", " + std::to_string(m.column_id) + ", '"
+            + sql_escape(rpred) + "', " + std::to_string(req_id) + ", 1, 0, NOW(6))";
+      }
+      if (OB_FAIL(ret = exec_session_sql(sql_engine, pc_service, session, context, task_sql))) {
+        return ret;
       }
     }
     return OB_SUCCESS;
@@ -6384,16 +6408,19 @@ static int handle_dml_ai_column(ObSql *sql_engine,
     }
     for (size_t ri = 0; ri < new_rows.size(); ++ri) {
       std::string rpred = build_rowkey_predicate(pk_cols, new_rows[ri]);
+      std::string task_sql =
+          "REPLACE INTO oceanbase.__all_ai_column_task "
+          "(table_id, column_id, rowkey_predicate, request_id, state, retry_count, eligible_ts) VALUES ";
       for (size_t ci = 0; ci < affected_ai.size(); ++ci) {
-        const AiColumnMeta &m = affected_ai[ci];
-        std::string task_sql =
-            "REPLACE INTO oceanbase.__all_ai_column_task "
-            "(table_id, column_id, rowkey_predicate, request_id, state, retry_count, eligible_ts) VALUES ("
-            + std::to_string(m.table_id) + ", " + std::to_string(m.column_id) + ", '"
-            + sql_escape(rpred) + "', " + std::to_string(req_id) + ", 1, 0, NOW(6))";
-        if (OB_FAIL(ret = exec_session_sql(sql_engine, pc_service, session, context, task_sql))) {
-          return ret;
+        if (ci > 0) {
+          task_sql += ", ";
         }
+        const AiColumnMeta &m = affected_ai[ci];
+        task_sql += "(" + std::to_string(m.table_id) + ", " + std::to_string(m.column_id) + ", '"
+            + sql_escape(rpred) + "', " + std::to_string(req_id) + ", 1, 0, NOW(6))";
+      }
+      if (OB_FAIL(ret = exec_session_sql(sql_engine, pc_service, session, context, task_sql))) {
+        return ret;
       }
     }
     return OB_SUCCESS;
