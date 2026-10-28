@@ -4573,6 +4573,16 @@ static std::string obj_to_string(const ObObj &cell)
   }
   if (cell.is_string_type()) {
     ObString s = cell.get_string();
+    if (cell.has_lob_header()) {
+      // TEXT/LOB results (e.g. CAST(... AS CHAR(4000))) carry a lob locator; read the in-row payload
+      ObLobLocatorV2 lob(s, true);
+      ObString inrow;
+      if (lob.has_inrow_data() && OB_SUCCESS == lob.get_inrow_data(inrow)) {
+        s = inrow;
+      } else {
+        return "";
+      }
+    }
     return std::string(NULL != s.ptr() ? s.ptr() : "", static_cast<size_t>(s.length()));
   }
   if (cell.get_type_class() == ObIntTC) {
@@ -4691,7 +4701,13 @@ static int proxy_exec_write(const std::string &sql)
   }
   ScopedInternalGuard guard;
   int64_t affected_rows = 0;
-  return GCTX.sql_proxy_->write(sql.c_str(), affected_rows);
+  int ret = GCTX.sql_proxy_->write(sql.c_str(), affected_rows);
+  if (OB_FAIL(ret)) {
+    LOG_WARN("ai column internal write failed", K(ret), "sql", sql.c_str());
+  } else {
+    LOG_DEBUG("ai column internal write", K(affected_rows), "sql", sql.substr(0, 512).c_str());
+  }
+  return ret;
 }
 
 static int proxy_exec_read(const std::string &sql, int64_t num_cols, std::vector<QueryRow> &out_rows)
@@ -5081,6 +5097,8 @@ static void ai_worker_process_once()
       const TaskItem &item = grp.items[ii];
       auto it = meta_map.find(std::make_pair(item.table_id, item.column_id));
       if (it == meta_map.end()) {
+        LOG_INFO("ai column worker: no metadata for task", K(item.table_id), K(item.column_id),
+                 "meta_cnt", meta_map.size());
         group_stale = true;
         break;
       }
@@ -5095,6 +5113,10 @@ static void ai_worker_process_once()
           "AND " + quote_ident(req_col) + " = " + std::to_string(item.request_id);
       std::vector<QueryRow> eval_rows;
       int eval_ret = proxy_exec_read(eval_sql, 1, eval_rows);
+      LOG_DEBUG("ai column worker eval", K(eval_ret), "rows", eval_rows.size(),
+               "is_null", eval_rows.empty() ? false : static_cast<bool>(eval_rows[0].is_nulls[0]),
+               "val", eval_rows.empty() ? "" : eval_rows[0].str_vals[0].substr(0, 200).c_str(),
+               "sql", eval_sql.substr(0, 512).c_str());
       if (OB_FAIL(eval_ret)) {
         group_failed = true;
       } else if (eval_rows.empty()) {
