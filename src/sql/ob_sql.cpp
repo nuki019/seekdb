@@ -4629,6 +4629,8 @@ static int exec_session_sql(ObSql *sql_engine,
   if (OB_ISNULL(inner_rs)) {
     return OB_ALLOCATE_MEMORY_FAILED;
   }
+  ObExecContext *saved_exec_ctx = session.get_cur_exec_ctx();
+  session.set_cur_exec_ctx(NULL);
   {
     LinkExecCtxGuard inner_guard(session, inner_rs->get_exec_context());
     inner_rs->get_exec_context().get_sql_exec_ctx().schema_service_ = GCTX.schema_service_;
@@ -4672,9 +4674,10 @@ static int exec_session_sql(ObSql *sql_engine,
       }
     }
   }
+  session.set_cur_exec_ctx(saved_exec_ctx);
   inner_rs->~ObResultSet();
   if (refresh_schema_after) {
-    session.get_cached_schema_guard_info().reset();
+    (void)session.get_cached_schema_guard_info().refresh_runtime_schema_guard();
   }
   return ret;
 }
@@ -5895,7 +5898,7 @@ static int handle_create_table_ai_column(ObSql *sql_engine,
   int ret = exec_session_sql(sql_engine, pc_service, session, context, rewritten_create, NULL, true);
   if (OB_SUCC(ret)) {
     ret = persist_ai_column_metadata(db_name, table_name, ai_defs);
-    session.get_cached_schema_guard_info().reset();
+    (void)session.get_cached_schema_guard_info().refresh_runtime_schema_guard();
   }
   return ret;
 }
@@ -6112,7 +6115,7 @@ static int handle_alter_table_ai_column(ObSql *sql_engine,
     }
     std::vector<ParsedAiColumnDef> defs{def};
     ret = persist_ai_column_metadata(db_name, table_name, defs);
-    session.get_cached_schema_guard_info().reset();
+    (void)session.get_cached_schema_guard_info().refresh_runtime_schema_guard();
     return ret;
   }
 
