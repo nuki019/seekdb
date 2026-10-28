@@ -101,6 +101,7 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     gt_filter_state_(GT_FILTER_UNKNOWN),
     gt_filter_threshold_(0.0)
 {
+  reset_linear_merge_state();
 }
 
 int ObSRDaaTIterImpl::init(
@@ -196,6 +197,7 @@ void ObSRDaaTIterImpl::reuse(const bool switch_tablet)
   input_row_cnt_ = 0;
   output_row_cnt_ = 0;
   gt_filter_state_ = GT_FILTER_UNKNOWN; // exec params may change on rescan
+  reset_linear_merge_state();
 }
 
   int ObSRDaaTIterImpl::get_query_max_score(double &score)
@@ -250,8 +252,9 @@ int ObSRDaaTIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
   } else {
     count = 0;
     const int64_t real_capacity = MIN(capacity, iter_param_->max_batch_size_);
+    const bool use_linear_merge = can_use_linear_merge();
     while (OB_SUCC(ret) && count < real_capacity) {
-      if (OB_FAIL(do_one_merge_round(count))) {
+      if (OB_FAIL(use_linear_merge ? linear_merge_round(count) : do_one_merge_round(count))) {
         if (OB_UNLIKELY(OB_ITER_END != ret)) {
         }
       }
@@ -269,6 +272,93 @@ int ObSRDaaTIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
 int ObSRDaaTIterImpl::pre_process()
 {
   return OB_NOT_IMPLEMENT;
+}
+
+bool ObSRDaaTIterImpl::can_use_linear_merge() const
+{
+  return support_linear_merge()
+      && merge_cmp_.has_fast_cmp()
+      && OB_NOT_NULL(dim_iters_)
+      && dim_iters_->count() > 0
+      && dim_iters_->count() <= LINEAR_MERGE_MAX_DIM_CNT;
+}
+
+void ObSRDaaTIterImpl::reset_linear_merge_state()
+{
+  for (int64_t i = 0; i < LINEAR_MERGE_MAX_DIM_CNT; ++i) {
+    lm_exhausted_[i] = false;
+    lm_scores_[i] = 0.0;
+  }
+}
+
+// Heap-free equivalent of fill_merge_heap() + collect_dims_by_id() for a few dimensions:
+// advance the dims consumed by the previous round, pick the smallest current id by a linear
+// scan, and collect every dim positioned on it (in ascending dim order).
+int ObSRDaaTIterImpl::linear_merge_round(int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  const int64_t dim_cnt = dim_iters_->count();
+  ObISRDaaTDimIter *const *dim_iters = dim_iters_->get_data();
+  int64_t *round_idxes = next_round_iter_idxes_.get_data();
+  const ObDatum **domain_ids = iter_domain_ids_.get_data();
+  const double *dim_weights = OB_NOT_NULL(iter_param_->dim_weights_) ? iter_param_->dim_weights_->get_data() : nullptr;
+  for (int64_t i = 0; OB_SUCC(ret) && i < next_round_cnt_; ++i) {
+    const int64_t iter_idx = round_idxes[i];
+    ObISRDaaTDimIter *dim_iter = dim_iters[iter_idx];
+    double score = 0.0;
+    if (OB_ISNULL(dim_iter)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(dim_iter->get_next_row())) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        LOG_WARN("fail to try load next batch dimension data", K(ret));
+      } else {
+        lm_exhausted_[iter_idx] = true;
+        ret = OB_SUCCESS;
+      }
+    } else if (OB_FAIL(dim_iter->get_curr_score(score))) {
+    } else if (OB_FAIL(dim_iter->get_curr_id(domain_ids[iter_idx]))) {
+    } else {
+      lm_scores_[iter_idx] = nullptr != dim_weights
+          ? score * iter_param_->field_boost_ * dim_weights[iter_idx] : score;
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else {
+    next_round_cnt_ = 0;
+    int64_t min_idx = -1;
+    for (int64_t i = 0; i < dim_cnt; ++i) {
+      if (!lm_exhausted_[i]
+          && (min_idx < 0 || merge_cmp_.fast_cmp_datum(*domain_ids[i], *domain_ids[min_idx]) < 0)) {
+        min_idx = i;
+      }
+    }
+    if (min_idx < 0) {
+      ret = OB_ITER_END;
+    } else {
+      // dims before min_idx are strictly greater, so collection starts at min_idx
+      for (int64_t i = min_idx; OB_SUCC(ret) && i < dim_cnt; ++i) {
+        if (!lm_exhausted_[i]
+            && (i == min_idx || 0 == merge_cmp_.fast_cmp_datum(*domain_ids[i], *domain_ids[min_idx]))) {
+          if (OB_FAIL(relevance_collector_->collect_one_dim(i, lm_scores_[i]))) {
+          } else {
+            round_idxes[next_round_cnt_++] = i;
+          }
+        }
+      }
+      const ObDatum *id_datum = domain_ids[min_idx];
+      double relevance = 0.0;
+      bool need_project = false;
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(relevance_collector_->get_result(relevance, need_project))) {
+      } else if (need_project && OB_FAIL(process_collected_row(*id_datum, relevance))) {
+      } else if (need_project && OB_FAIL(filter_on_demand(count, relevance, need_project))) {
+      } else if (need_project && OB_FAIL(cache_result(count, *id_datum, relevance))) {
+        if (OB_ITER_END != ret) {
+        }
+      }
+    }
+  }
+  return ret;
 }
 
 int ObSRDaaTIterImpl::do_one_merge_round(int64_t &count)

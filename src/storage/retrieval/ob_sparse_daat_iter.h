@@ -45,6 +45,8 @@ struct ObSRMergeCmp
 
   int init(sql::ObDatumMeta id_meta, const ObFixedArray<const ObDatum *, ObIAllocator> *iter_ids);
   int cmp(const ObSRMergeItem &l, const ObSRMergeItem &r, int64_t &cmp_ret);
+  bool has_fast_cmp() const { return ID_CMP_GENERIC != id_cmp_mode_; }
+  inline int fast_cmp_datum(const ObDatum &l, const ObDatum &r) const { return fast_cmp(id_cmp_mode_, l, r); }
 private:
   inline const ObDatum &get_id_datum(const int64_t iter_idx)
   {
@@ -122,6 +124,13 @@ protected:
   virtual int cache_result(int64_t &count, const ObDatum &id_datum, const double relevance);
   virtual int project_results(const int64_t count);
   int init_merge_heap(const int64_t count);
+  // Subclasses that only use the default merge primitives may opt in to the heap-free
+  // linear merge used for small dimension counts.
+  virtual bool support_linear_merge() const { return false; }
+  bool can_use_linear_merge() const;
+  void reset_linear_merge_state();
+  int linear_merge_round(int64_t &count);
+  static const int64_t LINEAR_MERGE_MAX_DIM_CNT = 8;
 protected:
   ObIAllocator *iter_allocator_;
   ObSparseRetrievalMergeParam *iter_param_;
@@ -139,6 +148,9 @@ protected:
   enum GtFilterState { GT_FILTER_UNKNOWN = 0, GT_FILTER_CACHED = 1, GT_FILTER_GENERIC = 2, BOOL_FILTER_CACHED = 3 };
   int8_t gt_filter_state_;
   double gt_filter_threshold_;
+  // linear merge state: per dim current (weighted) score and exhaustion flag
+  bool lm_exhausted_[LINEAR_MERGE_MAX_DIM_CNT];
+  double lm_scores_[LINEAR_MERGE_MAX_DIM_CNT];
 private:
   int try_cache_gt_filter_threshold();
   DISALLOW_COPY_AND_ASSIGN(ObSRDaaTIterImpl);

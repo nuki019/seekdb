@@ -63,6 +63,8 @@ public:
   virtual void reset() override;
 protected:
   virtual int pre_process() override;
+  // uses only the default merge primitives, so the heap-free linear merge is equivalent
+  virtual bool support_linear_merge() const override { return true; }
 protected:
   ObBM25ParamEstimator bm25_param_estimator_;
   sql::ObMatchAgainstMode mode_flag_;
