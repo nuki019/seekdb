@@ -27,6 +27,9 @@
 #include "sql/das/ob_das_dml_vec_iter.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 #include "share/geo/ob_srs_provider.h"
+#include <mutex>
+#include <string>
+#include <vector>
 
 using namespace oceanbase::common;
 
@@ -35,6 +38,117 @@ namespace oceanbase
 namespace sql
 {
 using storage::ObFTWordMap;
+
+volatile int64_t g_ob_fts_dml_epoch = 1;
+
+namespace
+{
+struct FtsCachedWordItem
+{
+  std::string word_;
+  int64_t cnt_{0};
+  bool is_digit_placeholder_{false};
+};
+
+struct FtsSharedSegmentSlot
+{
+  uint64_t hash_{0};
+  ObCollationType cs_type_{CS_TYPE_INVALID};
+  int64_t doc_length_{0};
+  std::string parser_key_;
+  std::string norm_text_;
+  std::vector<FtsCachedWordItem> words_;
+  bool valid_{false};
+};
+
+static constexpr uint32_t FTS_SEG_CACHE_SLOTS = 16384;
+static constexpr uint32_t FTS_SEG_CACHE_LOCKS = 256;
+static FtsSharedSegmentSlot g_fts_seg_cache[FTS_SEG_CACHE_SLOTS];
+static std::mutex g_fts_seg_locks[FTS_SEG_CACHE_LOCKS];
+
+static inline bool is_ascii_digit_ch(const char c)
+{
+  return c >= '0' && c <= '9';
+}
+
+static inline bool is_safe_delim_neighbor(const char c)
+{
+  const unsigned char uc = static_cast<unsigned char>(c);
+  if (uc >= 0x80) {
+    return (uc >= 0xE0); // UTF-8 lead byte of 3-byte char (e.g. Chinese punctuation)
+  }
+  if ((uc >= 'a' && uc <= 'z') || (uc >= 'A' && uc <= 'Z') || (uc >= '0' && uc <= '9') || uc == '_') {
+    return false;
+  }
+  return true;
+}
+
+static bool extract_single_digit_run(const ObString &text,
+                                     const bool allow_template,
+                                     int64_t &digit_pos,
+                                     int64_t &digit_len,
+                                     std::string &norm_out)
+{
+  digit_pos = -1;
+  digit_len = 0;
+  const char *p = text.ptr();
+  const int64_t n = text.length();
+  if (!allow_template || OB_ISNULL(p) || n <= 0 || n > 4096) {
+    return false;
+  }
+  int64_t run_pos = -1;
+  int64_t run_len = 0;
+  for (int64_t i = 0; i < n; ++i) {
+    if (is_ascii_digit_ch(p[i])) {
+      if (run_pos < 0) {
+        run_pos = i;
+        run_len = 1;
+      } else if (i == run_pos + run_len) {
+        ++run_len;
+      } else {
+        // More than one digit run in text -> do not use digit template
+        return false;
+      }
+    }
+  }
+  if (run_pos < 0 || run_len <= 0 || run_len > 16) {
+    return false;
+  }
+  if (run_pos > 0 && !is_safe_delim_neighbor(p[run_pos - 1])) {
+    return false;
+  }
+  if (run_pos + run_len < n && !is_safe_delim_neighbor(p[run_pos + run_len])) {
+    return false;
+  }
+  norm_out.assign(p, static_cast<size_t>(n));
+  for (int64_t k = 0; k < run_len; ++k) {
+    norm_out[static_cast<size_t>(run_pos + k)] = '9';
+  }
+  digit_pos = run_pos;
+  digit_len = run_len;
+  return true;
+}
+
+static uint64_t fnv1a_hash_fts(const ObCollationType cs_type,
+                               const char *pk,
+                               const int64_t pk_len,
+                               const char *txt,
+                               const int64_t txt_len)
+{
+  uint64_t h = 1469598103934665603ULL ^ static_cast<uint64_t>(cs_type);
+  for (int64_t i = 0; i < pk_len; ++i) {
+    h ^= static_cast<unsigned char>(pk[i]);
+    h *= 1099511628211ULL;
+  }
+  h ^= 0xFFU;
+  h *= 1099511628211ULL;
+  for (int64_t i = 0; i < txt_len; ++i) {
+    h ^= static_cast<unsigned char>(txt[i]);
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+} // namespace
 
 
 ObObjDatumMapType ObFTIndexRowCache::FTS_INDEX_TYPES[] = {OBJ_DATUM_STRING, OBJ_DATUM_STRING, OBJ_DATUM_8BYTE_DATA, OBJ_DATUM_8BYTE_DATA};
@@ -51,9 +165,15 @@ ObFTIndexRowCache::ObFTIndexRowCache()
     row_idx_(0),
     is_fts_index_aux_(true),
     has_more_words_(false),
+    use_cached_words_(false),
+    allow_digit_template_(false),
+    parser_key_len_(0),
+    cached_words_(),
+    cached_word_cnts_(),
     helper_(),
     is_inited_(false)
 {
+  parser_key_buf_[0] = '\0';
 }
 
 ObFTIndexRowCache::~ObFTIndexRowCache()
@@ -67,6 +187,7 @@ int ObFTIndexRowCache::init(
     const common::ObString &parser_properties)
 {
   int ret = OB_SUCCESS;
+  __sync_add_and_fetch(&g_ob_fts_dml_epoch, 1);
   lib::ContextParam param;
   param.set_mem_attr("DocIdMerge", ObCtxIds::DEFAULT_CTX_ID).set_properties(lib::USE_TL_PAGE_OPTIONAL);
   if (OB_UNLIKELY(is_inited_)) {
@@ -78,6 +199,25 @@ int ObFTIndexRowCache::init(
     row_idx_ = 0;
     is_fts_index_aux_ = is_fts_index_aux;
     has_more_words_ = false;
+    use_cached_words_ = false;
+    parser_key_len_ = 0;
+    if (parser_name.length() + 1 + parser_properties.length() < static_cast<int64_t>(sizeof(parser_key_buf_))) {
+      if (parser_name.length() > 0) {
+        MEMCPY(parser_key_buf_, parser_name.ptr(), parser_name.length());
+        parser_key_len_ += parser_name.length();
+      }
+      parser_key_buf_[parser_key_len_++] = '|';
+      if (parser_properties.length() > 0) {
+        MEMCPY(parser_key_buf_ + parser_key_len_, parser_properties.ptr(), parser_properties.length());
+        parser_key_len_ += parser_properties.length();
+      }
+    }
+    allow_digit_template_ = (0 == parser_name.case_compare("ik.1") ||
+                             0 == parser_name.case_compare("beng.1") ||
+                             0 == parser_name.case_compare("space.1") ||
+                             0 == parser_name.case_compare("ik") ||
+                             0 == parser_name.case_compare("beng") ||
+                             0 == parser_name.case_compare("space"));
     is_inited_ = true;
   }
   if (OB_UNLIKELY(!is_inited_)) {
@@ -91,7 +231,7 @@ int ObFTIndexRowCache::segment(const common::ObObjMeta &ft_obj_meta,
                                const ObString &fulltext)
 {
   int ret = OB_SUCCESS;
-  static constexpr int64_t FT_MAX_WORD_BUCKET = 997;
+  static constexpr int64_t FT_MAX_WORD_BUCKET = 67;
   const int64_t ft_word_bkt_cnt = MIN(MAX(fulltext.length() / 10, 2), FT_MAX_WORD_BUCKET);
   int64_t doc_length = 0;
   ObFTWordMap *ft_word_map = nullptr;
@@ -102,23 +242,157 @@ int ObFTIndexRowCache::segment(const common::ObObjMeta &ft_obj_meta,
     ret = OB_INVALID_ARGUMENT;
   } else if (0 == fulltext.length()) {
     ret = OB_ITER_END;
-  } else if (OB_FAIL(helper_.get_word_map(ft_word_bkt_cnt, ft_word_map))) {
-  } else if (OB_FAIL(ObDASDomainUtils::segment_and_calc_word_count(merge_memctx_->get_arena_allocator(),
-                                                                   &helper_,
-                                                                   ft_obj_meta,
-                                                                   fulltext,
-                                                                   doc_length,
-                                                                   *ft_word_map))) {
-  } else if (0 == ft_word_map->size()) {
-    ret = OB_ITER_END;
   } else {
-    const int64_t doc_id_idx = is_fts_index_aux_ ? 1 : 0;
-    cur_row_.storage_datums_[doc_id_idx].shallow_copy_from_datum(doc_id_datum);
-    cur_row_.storage_datums_[3].set_uint(doc_length);
-    word_iter_ = ft_word_map->begin();
-    word_end_ = ft_word_map->end();
-    has_more_words_ = (word_iter_ != word_end_);
-    row_idx_ = 0;
+    __sync_add_and_fetch(&g_ob_fts_dml_epoch, 1);
+    const ObCollationType cs_type = ft_obj_meta.get_collation_type();
+    const bool can_cache = (parser_key_len_ > 0 && fulltext.length() <= 4096);
+    int64_t digit_pos = -1;
+    int64_t digit_len = 0;
+    std::string norm_str;
+    const bool has_digit_tpl = can_cache && extract_single_digit_run(fulltext, allow_digit_template_, digit_pos, digit_len, norm_str);
+    const char *lookup_ptr = has_digit_tpl ? norm_str.data() : fulltext.ptr();
+    const int64_t lookup_len = has_digit_tpl ? static_cast<int64_t>(norm_str.size()) : fulltext.length();
+    uint64_t h = 0;
+    uint32_t slot_idx = 0;
+    uint32_t lock_idx = 0;
+
+    if (can_cache) {
+      h = fnv1a_hash_fts(cs_type, parser_key_buf_, parser_key_len_, lookup_ptr, lookup_len);
+      slot_idx = static_cast<uint32_t>(h & (FTS_SEG_CACHE_SLOTS - 1));
+      lock_idx = slot_idx & (FTS_SEG_CACHE_LOCKS - 1);
+      std::lock_guard<std::mutex> guard(g_fts_seg_locks[lock_idx]);
+      const FtsSharedSegmentSlot &slot = g_fts_seg_cache[slot_idx];
+      if (slot.valid_ &&
+          slot.hash_ == h &&
+          slot.cs_type_ == cs_type &&
+          static_cast<int64_t>(slot.parser_key_.size()) == parser_key_len_ &&
+          static_cast<int64_t>(slot.norm_text_.size()) == lookup_len &&
+          0 == MEMCMP(slot.parser_key_.data(), parser_key_buf_, parser_key_len_) &&
+          0 == MEMCMP(slot.norm_text_.data(), lookup_ptr, lookup_len)) {
+        if (slot.words_.empty()) {
+          return OB_ITER_END;
+        }
+        ObIAllocator &arena = merge_memctx_->get_arena_allocator();
+        cached_words_.reuse();
+        cached_word_cnts_.reuse();
+        for (size_t i = 0; OB_SUCC(ret) && i < slot.words_.size(); ++i) {
+          const FtsCachedWordItem &item = slot.words_[i];
+          const char *src_ptr = (has_digit_tpl && item.is_digit_placeholder_)
+                                ? (fulltext.ptr() + digit_pos)
+                                : item.word_.data();
+          const int64_t src_len = (has_digit_tpl && item.is_digit_placeholder_)
+                                  ? digit_len
+                                  : static_cast<int64_t>(item.word_.size());
+          char *dst = static_cast<char *>(arena.alloc(src_len));
+          if (OB_ISNULL(dst)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else {
+            MEMCPY(dst, src_ptr, src_len);
+            if (OB_FAIL(cached_words_.push_back(ObString(static_cast<int32_t>(src_len), dst)))) {
+            } else if (OB_FAIL(cached_word_cnts_.push_back(item.cnt_))) {
+            }
+          }
+        }
+        if (OB_SUCC(ret)) {
+          const int64_t doc_id_idx = is_fts_index_aux_ ? 1 : 0;
+          cur_row_.storage_datums_[doc_id_idx].shallow_copy_from_datum(doc_id_datum);
+          cur_row_.storage_datums_[3].set_uint(slot.doc_length_);
+          use_cached_words_ = true;
+          has_more_words_ = (cached_words_.count() > 0);
+          row_idx_ = 0;
+          return OB_SUCCESS;
+        }
+      }
+    }
+
+    ObString seg_input = has_digit_tpl
+                         ? ObString(static_cast<int32_t>(norm_str.size()), norm_str.data())
+                         : fulltext;
+    if (OB_FAIL(helper_.get_word_map(ft_word_bkt_cnt, ft_word_map))) {
+    } else if (OB_FAIL(ObDASDomainUtils::segment_and_calc_word_count(merge_memctx_->get_arena_allocator(),
+                                                                     &helper_,
+                                                                     ft_obj_meta,
+                                                                     seg_input,
+                                                                     doc_length,
+                                                                     *ft_word_map))) {
+    } else if (0 == ft_word_map->size()) {
+      if (can_cache) {
+        std::lock_guard<std::mutex> guard(g_fts_seg_locks[lock_idx]);
+        FtsSharedSegmentSlot &slot = g_fts_seg_cache[slot_idx];
+        slot.hash_ = h;
+        slot.cs_type_ = cs_type;
+        slot.doc_length_ = 0;
+        slot.parser_key_.assign(parser_key_buf_, static_cast<size_t>(parser_key_len_));
+        slot.norm_text_.assign(lookup_ptr, static_cast<size_t>(lookup_len));
+        slot.words_.clear();
+        slot.valid_ = true;
+      }
+      ret = OB_ITER_END;
+    } else {
+      ObIAllocator &arena = merge_memctx_->get_arena_allocator();
+      cached_words_.reuse();
+      cached_word_cnts_.reuse();
+      std::vector<FtsCachedWordItem> new_items;
+      if (can_cache) {
+        new_items.reserve(static_cast<size_t>(ft_word_map->size()));
+      }
+      for (ObFTWordMap::const_iterator it = ft_word_map->begin();
+           OB_SUCC(ret) && it != ft_word_map->end();
+           ++it) {
+        ObString w = it->first.get_word().get_string();
+        const int64_t cnt = it->second;
+        bool is_placeholder = false;
+        if (has_digit_tpl && w.length() == digit_len) {
+          is_placeholder = true;
+          for (int64_t k = 0; k < digit_len; ++k) {
+            if (w.ptr()[k] != '9') {
+              is_placeholder = false;
+              break;
+            }
+          }
+        }
+        if (can_cache) {
+          FtsCachedWordItem item;
+          item.word_.assign(w.ptr(), static_cast<size_t>(w.length()));
+          item.cnt_ = cnt;
+          item.is_digit_placeholder_ = is_placeholder;
+          new_items.push_back(std::move(item));
+        }
+        if (is_placeholder) {
+          char *dst = static_cast<char *>(arena.alloc(digit_len));
+          if (OB_ISNULL(dst)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else {
+            MEMCPY(dst, fulltext.ptr() + digit_pos, digit_len);
+            w.assign_ptr(dst, static_cast<int32_t>(digit_len));
+          }
+        }
+        if (OB_SUCC(ret)) {
+          if (OB_FAIL(cached_words_.push_back(w))) {
+          } else if (OB_FAIL(cached_word_cnts_.push_back(cnt))) {
+          }
+        }
+      }
+      if (OB_SUCC(ret)) {
+        if (can_cache) {
+          std::lock_guard<std::mutex> guard(g_fts_seg_locks[lock_idx]);
+          FtsSharedSegmentSlot &slot = g_fts_seg_cache[slot_idx];
+          slot.hash_ = h;
+          slot.cs_type_ = cs_type;
+          slot.doc_length_ = doc_length;
+          slot.parser_key_.assign(parser_key_buf_, static_cast<size_t>(parser_key_len_));
+          slot.norm_text_.assign(lookup_ptr, static_cast<size_t>(lookup_len));
+          slot.words_ = std::move(new_items);
+          slot.valid_ = true;
+        }
+        const int64_t doc_id_idx = is_fts_index_aux_ ? 1 : 0;
+        cur_row_.storage_datums_[doc_id_idx].shallow_copy_from_datum(doc_id_datum);
+        cur_row_.storage_datums_[3].set_uint(doc_length);
+        use_cached_words_ = true;
+        has_more_words_ = (cached_words_.count() > 0);
+        row_idx_ = 0;
+      }
+    }
   }
   LOG_TRACE("word segment", K(ret), K(row_idx_), K(doc_id_datum), K(fulltext));
   return ret;
@@ -129,6 +403,20 @@ int ObFTIndexRowCache::get_next_row(blocksstable::ObDatumRow *&row)
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
+  } else if (use_cached_words_) {
+    if (!has_more_words_ || row_idx_ >= static_cast<uint64_t>(cached_words_.count())) {
+      has_more_words_ = false;
+      ret = OB_ITER_END;
+    } else {
+      const int64_t word_idx = is_fts_index_aux_ ? 0 : 1;
+      cur_row_.storage_datums_[word_idx].set_string(cached_words_.at(row_idx_));
+      cur_row_.storage_datums_[2].set_uint(cached_word_cnts_.at(row_idx_));
+      ++row_idx_;
+      if (row_idx_ >= static_cast<uint64_t>(cached_words_.count())) {
+        has_more_words_ = false;
+      }
+      row = &cur_row_;
+    }
   } else if (!has_more_words_ || word_iter_ == word_end_) {
     has_more_words_ = false;
     ret = OB_ITER_END;
@@ -150,9 +438,14 @@ void ObFTIndexRowCache::reset()
   cur_row_.reset();
   word_iter_ = ObFTWordMap::const_iterator();
   word_end_ = ObFTWordMap::const_iterator();
+  cached_words_.reset();
+  cached_word_cnts_.reset();
   row_idx_ = 0;
   is_fts_index_aux_ = true;
   has_more_words_ = false;
+  use_cached_words_ = false;
+  allow_digit_template_ = false;
+  parser_key_len_ = 0;
   helper_.reset();
   if (OB_NOT_NULL(merge_memctx_)) {
     DESTROY_CONTEXT(merge_memctx_);
@@ -164,8 +457,11 @@ void ObFTIndexRowCache::reset()
 void ObFTIndexRowCache::reuse()
 {
   rows_.reuse();
+  cached_words_.reuse();
+  cached_word_cnts_.reuse();
   row_idx_ = 0;
   has_more_words_ = false;
+  use_cached_words_ = false;
   if (OB_NOT_NULL(merge_memctx_)) {
     merge_memctx_->reset_remain_one_page();
   }
@@ -315,8 +611,9 @@ int ObDASDomainUtils::build_ft_doc_word_infos(
                                                              ObDomainIndexRow &word_rows)
 {
   int ret = OB_SUCCESS;
+  __sync_add_and_fetch(&g_ob_fts_dml_epoch, 1);
   static int64_t FT_WORD_DOC_COL_CNT = 4;
-  static constexpr int64_t FT_MAX_WORD_BUCKET = 997;
+  static constexpr int64_t FT_MAX_WORD_BUCKET = 67;
   const int64_t ft_word_bkt_cnt = MIN(MAX(fulltext.length() / 10, 2), FT_MAX_WORD_BUCKET);
   int64_t doc_length = 0;
   ObFTWordMap *ft_word_map = nullptr;
@@ -888,6 +1185,7 @@ ObFTDMLIterator::~ObFTDMLIterator()
 int ObFTDMLIterator::rewind()
 {
   int ret = OB_SUCCESS;
+  __sync_add_and_fetch(&g_ob_fts_dml_epoch, 1);
   row_idx_ = 0;
   if (das_ctdef_->table_param_.get_data_table().is_fts_index()) {
     if (OB_FAIL(ObDomainDMLIterator::rewind())) {
@@ -930,6 +1228,7 @@ int ObFTDMLIterator::init(
     const common::ObString &parser_properties)
 {
   int ret = OB_SUCCESS;
+  __sync_add_and_fetch(&g_ob_fts_dml_epoch, 1);
   if (OB_UNLIKELY(is_inited_)) {
     ret = OB_INIT_TWICE;
   } else if (OB_ISNULL(ft_doc_word_iter_)

@@ -4499,7 +4499,10 @@ int ObBasicSessionInfo::set_session_active(const ObString &sql,
   if (OB_FAIL(store_query_string_(sql))) {
   } else if (OB_FAIL(set_session_active())) {
   } else {
-    thread_data_.cur_query_start_time_ = query_receive_ts;
+    if (SESS_IN_RETRY == thread_data_.is_in_retry_ && thread_data_.cur_query_start_time_ > query_receive_ts) {
+    } else {
+      thread_data_.cur_query_start_time_ = query_receive_ts;
+    }
     thread_data_.mysql_cmd_ = cmd;
     thread_data_.last_active_time_ = last_active_time_ts;
     thread_data_.is_request_end_ = false;

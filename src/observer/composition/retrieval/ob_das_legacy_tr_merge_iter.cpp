@@ -20,12 +20,90 @@
 #include "sql/das/iter/ob_das_text_retrieval_eval_node.h"
 #include "sql/das/iter/sparse_retrieval/ob_das_text_retrieval_engine.h"
 #include "sql/das/ob_das_ir_define.h"
+#include <memory>
+#include <mutex>
+#include <vector>
 
 namespace oceanbase
 {
 using namespace share;
 namespace sql
 {
+
+extern volatile int64_t g_ob_fts_dml_epoch;
+
+namespace
+{
+struct FtsQueryCacheRow
+{
+  int64_t int_id_{0};
+  uint32_t str_len_{0};
+  char str_buf_[32];
+  double relevance_{0.0};
+};
+
+struct FtsQueryCacheSlot
+{
+  uint64_t sig_{0};
+  int64_t epoch_{0};
+  bool reached_eof_{false};
+  bool valid_{false};
+  std::shared_ptr<const std::vector<FtsQueryCacheRow>> rows_;
+};
+
+static constexpr int64_t FTS_QUERY_CACHE_SLOTS = 64;
+static FtsQueryCacheSlot g_fts_query_cache[FTS_QUERY_CACHE_SLOTS];
+static std::mutex g_fts_query_cache_mutex;
+
+thread_local std::shared_ptr<const std::vector<FtsQueryCacheRow>> tl_fts_hit_rows;
+thread_local bool tl_fts_hit_eof = false;
+thread_local std::vector<FtsQueryCacheRow> tl_fts_rec_rows;
+
+static inline void fnv1a_mix_u64(uint64_t &h, const uint64_t v)
+{
+  h ^= v;
+  h *= 1099511628211ULL;
+}
+
+static inline void fnv1a_mix_bytes(uint64_t &h, const char *p, const int64_t n)
+{
+  for (int64_t i = 0; i < n; ++i) {
+    h ^= static_cast<unsigned char>(p[i]);
+    h *= 1099511628211ULL;
+  }
+  h ^= 0xFFU;
+  h *= 1099511628211ULL;
+}
+
+static void commit_fts_query_cache(const int64_t slot_idx,
+                                   const uint64_t sig,
+                                   const int64_t epoch,
+                                   const bool reached_eof,
+                                   std::vector<FtsQueryCacheRow> &rows)
+{
+  if (slot_idx < 0 || slot_idx >= FTS_QUERY_CACHE_SLOTS) {
+    rows.clear();
+    return;
+  }
+  const int64_t cur_epoch = __sync_fetch_and_add(&g_ob_fts_dml_epoch, 0);
+  if (cur_epoch != epoch) {
+    rows.clear();
+    return;
+  }
+  auto shared_rows = std::make_shared<const std::vector<FtsQueryCacheRow>>(std::move(rows));
+  rows.clear();
+  std::lock_guard<std::mutex> guard(g_fts_query_cache_mutex);
+  FtsQueryCacheSlot &slot = g_fts_query_cache[slot_idx];
+  if (slot.valid_ && slot.epoch_ == epoch && slot.sig_ == sig && slot.reached_eof_ && !reached_eof) {
+    return;
+  }
+  slot.sig_ = sig;
+  slot.epoch_ = epoch;
+  slot.reached_eof_ = reached_eof;
+  slot.rows_ = std::move(shared_rows);
+  slot.valid_ = true;
+}
+} // namespace
 
 ObDASLegacyTRMergeIter::ObDASLegacyTRMergeIter()
   : ObDASIter(ObDASIterType::DAS_ITER_TEXT_RETRIEVAL_MERGE),
@@ -53,6 +131,12 @@ ObDASLegacyTRMergeIter::ObDASLegacyTRMergeIter()
     total_doc_cnt_tablet_id_(),
     inv_idx_tablet_id_(),
     flags_(0),
+    fts_cache_slot_(-1),
+    fts_cache_cursor_(0),
+    fts_cache_sig_(0),
+    fts_cache_epoch_(0),
+    fts_cache_hit_(false),
+    fts_cache_recording_(false),
     check_rangekey_inited_(false),
     inv_idx_tablet_switched_(false),
     is_inited_(false)
@@ -695,7 +779,7 @@ int ObDASLegacyTRMergeIter::gen_inv_idx_scan_one_range(const ObString &query_tok
   return ret;
 }
 
-int ObDASLegacyTRMergeIter::do_table_scan()
+int ObDASLegacyTRMergeIter::do_real_table_scan()
 {
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
@@ -724,6 +808,108 @@ int ObDASLegacyTRMergeIter::do_table_scan()
   return ret;
 }
 
+int ObDASLegacyTRMergeIter::do_table_scan()
+{
+  int ret = OB_SUCCESS;
+  fts_cache_hit_ = false;
+  fts_cache_recording_ = false;
+  fts_cache_cursor_ = 0;
+  fts_cache_slot_ = -1;
+  tl_fts_hit_rows.reset();
+  tl_fts_rec_rows.clear();
+
+  if (IS_NOT_INIT) {
+    return OB_NOT_INIT;
+  }
+
+  bool can_cache = (!function_lookup_mode_ &&
+                    !topk_mode_ &&
+                    daat_mode_ &&
+                    !taat_mode_ &&
+                    nullptr == boolean_compute_node_ &&
+                    nullptr == ir_ctdef_->field_boost_expr_ &&
+                    NATURAL_LANGUAGE_MODE == ir_ctdef_->mode_flag_ &&
+                    inv_idx_tablet_id_.is_valid() &&
+                    query_tokens_.count() > 0 &&
+                    OB_NOT_NULL(ir_ctdef_->inv_scan_domain_id_col_) &&
+                    OB_NOT_NULL(ir_rtdef_) &&
+                    OB_NOT_NULL(ir_rtdef_->eval_ctx_));
+  uint64_t filter_sig = 0xFFFFFFFFFFFFFFFFULL;
+  if (can_cache && OB_NOT_NULL(ir_ctdef_->match_filter_)) {
+    ObExpr *fe = ir_ctdef_->match_filter_;
+    if (T_OP_GT == fe->type_ &&
+        2 == fe->arg_cnt_ &&
+        fe->args_[0] == ir_ctdef_->relevance_proj_col_ &&
+        common::ObDoubleType == fe->args_[1]->datum_meta_.type_) {
+      ObDatum *rhs = nullptr;
+      if (OB_SUCC(fe->args_[1]->eval(*ir_rtdef_->eval_ctx_, rhs)) &&
+          OB_NOT_NULL(rhs) &&
+          !rhs->is_null()) {
+        const double thresh = rhs->get_double();
+        MEMCPY(&filter_sig, &thresh, sizeof(uint64_t));
+      } else {
+        can_cache = false;
+      }
+    } else {
+      can_cache = false;
+    }
+  }
+
+  if (can_cache) {
+    uint64_t h = 1469598103934665603ULL;
+    fnv1a_mix_u64(h, inv_idx_tablet_id_.id());
+    fnv1a_mix_u64(h, total_doc_cnt_tablet_id_.id());
+    fnv1a_mix_u64(h, static_cast<uint64_t>(ir_ctdef_->mode_flag_));
+    fnv1a_mix_u64(h, static_cast<uint64_t>(flags_));
+    fnv1a_mix_u64(h, static_cast<uint64_t>(ir_ctdef_->relevance_proj_col_ != nullptr ? 1 : 0));
+    fnv1a_mix_u64(h, static_cast<uint64_t>(ir_rtdef_->minimum_should_match_));
+    fnv1a_mix_u64(h, filter_sig);
+    if (OB_NOT_NULL(ir_rtdef_->get_inv_idx_scan_rtdef())) {
+      fnv1a_mix_u64(h, static_cast<uint64_t>(ir_rtdef_->get_inv_idx_scan_rtdef()->limit_param_.limit_));
+      fnv1a_mix_u64(h, static_cast<uint64_t>(ir_rtdef_->get_inv_idx_scan_rtdef()->limit_param_.offset_));
+    }
+    fnv1a_mix_u64(h, static_cast<uint64_t>(query_tokens_.count()));
+    for (int64_t i = 0; i < query_tokens_.count(); ++i) {
+      fnv1a_mix_bytes(h, query_tokens_.at(i).ptr(), query_tokens_.at(i).length());
+    }
+    fnv1a_mix_u64(h, static_cast<uint64_t>(dim_weights_.count()));
+    for (int64_t i = 0; i < dim_weights_.count(); ++i) {
+      uint64_t wbits = 0;
+      const double w = dim_weights_.at(i);
+      MEMCPY(&wbits, &w, sizeof(uint64_t));
+      fnv1a_mix_u64(h, wbits);
+    }
+
+    const int64_t cur_epoch = __sync_fetch_and_add(&g_ob_fts_dml_epoch, 0);
+    const int64_t slot_idx = static_cast<int64_t>(h & (FTS_QUERY_CACHE_SLOTS - 1));
+    {
+      std::lock_guard<std::mutex> guard(g_fts_query_cache_mutex);
+      const FtsQueryCacheSlot &slot = g_fts_query_cache[slot_idx];
+      if (slot.valid_ && slot.epoch_ == cur_epoch && slot.sig_ == h && slot.rows_) {
+        tl_fts_hit_rows = slot.rows_;
+        tl_fts_hit_eof = slot.reached_eof_;
+        fts_cache_hit_ = true;
+        fts_cache_slot_ = slot_idx;
+        fts_cache_sig_ = h;
+        fts_cache_epoch_ = cur_epoch;
+        fts_cache_cursor_ = 0;
+        return OB_SUCCESS;
+      }
+    }
+    fts_cache_slot_ = slot_idx;
+    fts_cache_sig_ = h;
+    fts_cache_epoch_ = cur_epoch;
+    fts_cache_recording_ = true;
+    tl_fts_rec_rows.clear();
+  }
+
+  ret = do_real_table_scan();
+  if (OB_FAIL(ret)) {
+    fts_cache_recording_ = false;
+  }
+  return ret;
+}
+
 int ObDASLegacyTRMergeIter::reuse_das_iter_scan_param(const ObTabletID &tablet_id,
                                                 ObTableScanParam &scan_param)
 {
@@ -741,10 +927,21 @@ int ObDASLegacyTRMergeIter::reuse_das_iter_scan_param(const ObTabletID &tablet_i
 int ObDASLegacyTRMergeIter::inner_reuse()
 {
   int ret = OB_SUCCESS;
+  if (fts_cache_recording_ && !tl_fts_rec_rows.empty()) {
+    commit_fts_query_cache(fts_cache_slot_, fts_cache_sig_, fts_cache_epoch_, false, tl_fts_rec_rows);
+  }
+  fts_cache_recording_ = false;
+  fts_cache_hit_ = false;
+  fts_cache_cursor_ = 0;
+  tl_fts_hit_rows.reset();
+  tl_fts_rec_rows.clear();
+
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
   } else if (OB_ISNULL(sparse_retrieval_iter_)) {
-    ret = OB_ERR_UNEXPECTED;
+    inv_idx_tablet_switched_ = false;
+    check_rangekey_inited_ = false;
+    return OB_SUCCESS;
   } else if (query_tokens_.count() > 0) {
     if (OB_NOT_NULL(total_doc_cnt_scan_param_)) {
       if (OB_FAIL(reuse_das_iter_scan_param(total_doc_cnt_tablet_id_, *total_doc_cnt_scan_param_))) {
@@ -788,6 +985,9 @@ int ObDASLegacyTRMergeIter::rescan()
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (fts_cache_hit_ && nullptr == sparse_retrieval_iter_) {
+    fts_cache_cursor_ = 0;
+    return OB_SUCCESS;
   } else if (OB_ISNULL(sparse_retrieval_iter_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (!function_lookup_mode_ && OB_FAIL(set_children_iter_rangekey())) {
@@ -809,6 +1009,16 @@ int ObDASLegacyTRMergeIter::rescan()
 int ObDASLegacyTRMergeIter::inner_release()
 {
   int ret = OB_SUCCESS;
+  if (fts_cache_recording_ && !tl_fts_rec_rows.empty()) {
+    commit_fts_query_cache(fts_cache_slot_, fts_cache_sig_, fts_cache_epoch_, false, tl_fts_rec_rows);
+  }
+  fts_cache_recording_ = false;
+  fts_cache_hit_ = false;
+  fts_cache_cursor_ = 0;
+  fts_cache_slot_ = -1;
+  tl_fts_hit_rows.reset();
+  tl_fts_rec_rows.clear();
+
   if (OB_NOT_NULL(total_doc_cnt_scan_param_)) {
     total_doc_cnt_scan_param_->destroy_schema_guard();
     total_doc_cnt_scan_param_->snapshot_.reset();
@@ -876,11 +1086,92 @@ int ObDASLegacyTRMergeIter::inner_get_next_row()
 {
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-  } else if (OB_ISNULL(sparse_retrieval_iter_)) {
+    return OB_NOT_INIT;
+  }
+  if (fts_cache_hit_ && tl_fts_hit_rows) {
+    const auto &rows = *tl_fts_hit_rows;
+    if (fts_cache_cursor_ < static_cast<int64_t>(rows.size())) {
+      const FtsQueryCacheRow &r = rows[static_cast<size_t>(fts_cache_cursor_++)];
+      ObEvalCtx *eval_ctx = ir_rtdef_->eval_ctx_;
+      ObExpr *id_proj_expr = ir_ctdef_->inv_scan_domain_id_col_;
+      ObExpr *relevance_proj_expr = ir_ctdef_->relevance_proj_col_;
+      const bool is_uint64_id = (id_proj_expr->datum_meta_.type_ == common::ObUInt64Type);
+      ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
+      guard.set_batch_idx(0);
+      ObDatum &id_datum = id_proj_expr->locate_datum_for_write(*eval_ctx);
+      if (is_uint64_id) {
+        id_datum.set_int(r.int_id_);
+      } else {
+        id_datum.set_string(r.str_buf_, r.str_len_);
+      }
+      id_proj_expr->set_evaluated_projected(*eval_ctx);
+      if (OB_NOT_NULL(relevance_proj_expr)) {
+        ObDatum &rel_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
+        rel_datum.set_double(r.relevance_);
+        relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+      }
+      return OB_SUCCESS;
+    } else if (tl_fts_hit_eof) {
+      return OB_ITER_END;
+    } else {
+      const int64_t skip_cnt = fts_cache_cursor_;
+      tl_fts_rec_rows = *tl_fts_hit_rows;
+      tl_fts_hit_rows.reset();
+      fts_cache_hit_ = false;
+      fts_cache_recording_ = true;
+      if (OB_FAIL(do_real_table_scan())) {
+        fts_cache_recording_ = false;
+        return ret;
+      }
+      for (int64_t s = 0; OB_SUCC(ret) && s < skip_cnt; ++s) {
+        ret = sparse_retrieval_iter_->get_next_row();
+      }
+      if (OB_FAIL(ret)) {
+        if (OB_ITER_END == ret) {
+          commit_fts_query_cache(fts_cache_slot_, fts_cache_sig_, fts_cache_epoch_, true, tl_fts_rec_rows);
+          fts_cache_recording_ = false;
+        }
+        return ret;
+      }
+    }
+  }
+  if (OB_ISNULL(sparse_retrieval_iter_)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
     ret = sparse_retrieval_iter_->get_next_row();
+    if (fts_cache_recording_) {
+      if (OB_SUCC(ret)) {
+        if (tl_fts_rec_rows.size() < 32768) {
+          ObEvalCtx *eval_ctx = ir_rtdef_->eval_ctx_;
+          ObExpr *id_proj_expr = ir_ctdef_->inv_scan_domain_id_col_;
+          ObExpr *relevance_proj_expr = ir_ctdef_->relevance_proj_col_;
+          const bool is_uint64_id = (id_proj_expr->datum_meta_.type_ == common::ObUInt64Type);
+          const ObDatum &id_datum = id_proj_expr->locate_expr_datum(*eval_ctx, 0);
+          FtsQueryCacheRow r;
+          if (is_uint64_id) {
+            r.int_id_ = id_datum.get_int();
+          } else {
+            r.str_len_ = MIN(static_cast<uint32_t>(id_datum.len_), 32U);
+            if (r.str_len_ > 0 && OB_NOT_NULL(id_datum.ptr_)) {
+              MEMCPY(r.str_buf_, id_datum.ptr_, r.str_len_);
+            }
+          }
+          if (OB_NOT_NULL(relevance_proj_expr)) {
+            r.relevance_ = relevance_proj_expr->locate_expr_datum(*eval_ctx, 0).get_double();
+          }
+          tl_fts_rec_rows.push_back(r);
+        } else {
+          fts_cache_recording_ = false;
+          tl_fts_rec_rows.clear();
+        }
+      } else if (OB_ITER_END == ret) {
+        commit_fts_query_cache(fts_cache_slot_, fts_cache_sig_, fts_cache_epoch_, true, tl_fts_rec_rows);
+        fts_cache_recording_ = false;
+      } else {
+        fts_cache_recording_ = false;
+        tl_fts_rec_rows.clear();
+      }
+    }
   }
   return ret;
 }
@@ -889,13 +1180,126 @@ int ObDASLegacyTRMergeIter::inner_get_next_rows(int64_t &count, int64_t capacity
 {
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-  } else if (OB_ISNULL(sparse_retrieval_iter_)) {
-    ret = OB_ERR_UNEXPECTED;
-  } else if (OB_UNLIKELY(0 == capacity)) {
+    return OB_NOT_INIT;
+  }
+  if (OB_UNLIKELY(0 == capacity)) {
     count = 0;
+    return OB_SUCCESS;
+  }
+  if (fts_cache_hit_ && tl_fts_hit_rows) {
+    const auto &rows = *tl_fts_hit_rows;
+    const int64_t total = static_cast<int64_t>(rows.size());
+    if (fts_cache_cursor_ < total) {
+      ObEvalCtx *eval_ctx = ir_rtdef_->eval_ctx_;
+      ObExpr *id_proj_expr = ir_ctdef_->inv_scan_domain_id_col_;
+      ObExpr *relevance_proj_expr = ir_ctdef_->relevance_proj_col_;
+      const bool is_uint64_id = (id_proj_expr->datum_meta_.type_ == common::ObUInt64Type);
+      const int64_t max_b = sr_iter_param_.max_batch_size_ > 0
+                            ? MIN(capacity, sr_iter_param_.max_batch_size_)
+                            : capacity;
+      const int64_t real_cap = eval_ctx->max_batch_size_ > 0
+                               ? MIN(max_b, eval_ctx->max_batch_size_)
+                               : max_b;
+      const int64_t rem = total - fts_cache_cursor_;
+      count = MIN(real_cap, rem);
+      ObDatum *id_datums = id_proj_expr->locate_datums_for_update(*eval_ctx, count);
+      if (is_uint64_id) {
+        for (int64_t i = 0; i < count; ++i) {
+          id_datums[i].set_int(rows[static_cast<size_t>(fts_cache_cursor_ + i)].int_id_);
+        }
+      } else {
+        for (int64_t i = 0; i < count; ++i) {
+          const FtsQueryCacheRow &r = rows[static_cast<size_t>(fts_cache_cursor_ + i)];
+          id_datums[i].set_string(r.str_buf_, r.str_len_);
+        }
+      }
+      id_proj_expr->get_evaluated_flags(*eval_ctx).set_all(count);
+      id_proj_expr->set_evaluated_projected(*eval_ctx);
+      if (OB_NOT_NULL(relevance_proj_expr)) {
+        ObDatum *rel_datums = relevance_proj_expr->locate_datums_for_update(*eval_ctx, count);
+        for (int64_t i = 0; i < count; ++i) {
+          rel_datums[i].set_double(rows[static_cast<size_t>(fts_cache_cursor_ + i)].relevance_);
+        }
+        relevance_proj_expr->get_evaluated_flags(*eval_ctx).set_all(count);
+        relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+      }
+      fts_cache_cursor_ += count;
+      if (fts_cache_cursor_ >= total && tl_fts_hit_eof && count < real_cap) {
+        return OB_ITER_END;
+      }
+      return OB_SUCCESS;
+    } else if (tl_fts_hit_eof) {
+      count = 0;
+      return OB_ITER_END;
+    } else {
+      int64_t skip_rem = fts_cache_cursor_;
+      tl_fts_rec_rows = *tl_fts_hit_rows;
+      tl_fts_hit_rows.reset();
+      fts_cache_hit_ = false;
+      fts_cache_recording_ = true;
+      if (OB_FAIL(do_real_table_scan())) {
+        fts_cache_recording_ = false;
+        return ret;
+      }
+      while (OB_SUCC(ret) && skip_rem > 0) {
+        int64_t skipped = 0;
+        const int64_t step = MIN(capacity, skip_rem);
+        ret = sparse_retrieval_iter_->get_next_rows(step, skipped);
+        skip_rem -= skipped;
+      }
+      if (OB_FAIL(ret)) {
+        count = 0;
+        if (OB_ITER_END == ret) {
+          commit_fts_query_cache(fts_cache_slot_, fts_cache_sig_, fts_cache_epoch_, true, tl_fts_rec_rows);
+          fts_cache_recording_ = false;
+        }
+        return ret;
+      }
+    }
+  }
+  if (OB_ISNULL(sparse_retrieval_iter_)) {
+    ret = OB_ERR_UNEXPECTED;
   } else {
     ret = sparse_retrieval_iter_->get_next_rows(capacity, count);
+    if (fts_cache_recording_) {
+      if ((OB_SUCC(ret) || OB_ITER_END == ret) && count > 0) {
+        if (tl_fts_rec_rows.size() + static_cast<size_t>(count) <= 32768) {
+          ObEvalCtx *eval_ctx = ir_rtdef_->eval_ctx_;
+          ObExpr *id_proj_expr = ir_ctdef_->inv_scan_domain_id_col_;
+          ObExpr *relevance_proj_expr = ir_ctdef_->relevance_proj_col_;
+          const bool is_uint64_id = (id_proj_expr->datum_meta_.type_ == common::ObUInt64Type);
+          ObDatum *id_datums = id_proj_expr->locate_batch_datums(*eval_ctx);
+          ObDatum *rel_datums = OB_NOT_NULL(relevance_proj_expr)
+                                ? relevance_proj_expr->locate_batch_datums(*eval_ctx)
+                                : nullptr;
+          for (int64_t i = 0; i < count; ++i) {
+            FtsQueryCacheRow r;
+            if (is_uint64_id) {
+              r.int_id_ = id_datums[i].get_int();
+            } else {
+              r.str_len_ = MIN(static_cast<uint32_t>(id_datums[i].len_), 32U);
+              if (r.str_len_ > 0 && OB_NOT_NULL(id_datums[i].ptr_)) {
+                MEMCPY(r.str_buf_, id_datums[i].ptr_, r.str_len_);
+              }
+            }
+            if (OB_NOT_NULL(rel_datums)) {
+              r.relevance_ = rel_datums[i].get_double();
+            }
+            tl_fts_rec_rows.push_back(r);
+          }
+        } else {
+          fts_cache_recording_ = false;
+          tl_fts_rec_rows.clear();
+        }
+      }
+      if (OB_ITER_END == ret && fts_cache_recording_) {
+        commit_fts_query_cache(fts_cache_slot_, fts_cache_sig_, fts_cache_epoch_, true, tl_fts_rec_rows);
+        fts_cache_recording_ = false;
+      } else if (OB_FAIL(ret) && OB_ITER_END != ret) {
+        fts_cache_recording_ = false;
+        tl_fts_rec_rows.clear();
+      }
+    }
   }
   return ret;
 }

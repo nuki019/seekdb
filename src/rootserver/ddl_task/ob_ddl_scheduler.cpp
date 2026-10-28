@@ -974,7 +974,9 @@ void ObDDLScheduler::do_work()
           } else if (need_schedule) {
             idler_.wakeup();
           }
-          first_retry_task = nullptr == first_retry_task ? task : first_retry_task;
+          if (!need_schedule) {
+            first_retry_task = nullptr == first_retry_task ? task : first_retry_task;
+          }
         } else if (OB_FAIL(remove_ddl_task(task))) {
         }
       }
@@ -3141,9 +3143,12 @@ int ObDDLScheduler::on_sstable_complement_job_reply(
             ret = OB_NOT_SUPPORTED;
             break;
         }
+        task.enable_schedule();
         return ret;
         task.add_event_info("on sstable complement job reply");
       }))) {
+  } else {
+    idler_.wakeup();
   }
   if (OB_ENTRY_NOT_EXIST == ret) {
     ret = OB_NEED_RETRY;
@@ -3166,9 +3171,13 @@ int ObDDLScheduler::on_ddl_task_finish(
   } else {
     ObDDLTask *ddl_task = nullptr;
     if (OB_FAIL(task_queue_.modify_task(parent_task_id, [&child_task_key, &ret_code](ObDDLTask &task) -> int {
-          return task.on_child_task_finish(child_task_key.object_id_, ret_code);
+          int inner_ret = task.on_child_task_finish(child_task_key.object_id_, ret_code);
+          task.enable_schedule();
+          return inner_ret;
         task.add_event_info("ddl task finish");
         }))) {
+    } else {
+      idler_.wakeup();
     }
   }
   LOG_INFO("ddl task on finish", K(ret), K(ret_code), "ddl_event_info", ObDDLEventInfo(GCTX.self_addr()), K(parent_task_id), K(child_task_key), K(parent_task_trace_id));

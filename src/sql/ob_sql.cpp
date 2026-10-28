@@ -6597,7 +6597,75 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
   bool is_begin_commit_stmt = false;
   bool is_file_sql_rewritten = false;
 
-  if (OB_SUCC(ret) && !trimed_stmt.empty() && !ai_column::g_in_ai_column_internal && !session.is_inner()) {
+  const auto has_intercept_keyword = [](const ObString &stmt) -> bool {
+    const char *p = stmt.ptr();
+    const int64_t len = stmt.length();
+    if (OB_ISNULL(p) || len <= 0) {
+      return false;
+    }
+    int64_t i = 0;
+    while (i < len) {
+      while (i < len && static_cast<unsigned char>(p[i]) <= ' ') {
+        ++i;
+      }
+      if (i + 1 < len && p[i] == '-' && p[i + 1] == '-') {
+        i += 2;
+        while (i < len && p[i] != '\n' && p[i] != '\r') {
+          ++i;
+        }
+        continue;
+      }
+      if (i < len && p[i] == '#') {
+        ++i;
+        while (i < len && p[i] != '\n' && p[i] != '\r') {
+          ++i;
+        }
+        continue;
+      }
+      if (i + 1 < len && p[i] == '/' && p[i + 1] == '*') {
+        if (i + 2 < len && p[i + 2] == '!') {
+          break;
+        }
+        i += 2;
+        while (i + 1 < len && !(p[i] == '*' && p[i + 1] == '/')) {
+          ++i;
+        }
+        i = (i + 1 < len) ? (i + 2) : len;
+        continue;
+      }
+      break;
+    }
+    if (i >= len) {
+      return false;
+    }
+    const char c0 = static_cast<char>(p[i] | 0x20);
+    if (c0 == 's') {
+      if (ai_column::g_ai_meta_tables_ready.load(std::memory_order_acquire)) {
+        return true;
+      }
+      for (int64_t k = i; k + 5 <= len; ++k) {
+        const char k0 = static_cast<char>(p[k] | 0x20);
+        if (k0 == 'f' &&
+            static_cast<char>(p[k + 1] | 0x20) == 'i' &&
+            static_cast<char>(p[k + 2] | 0x20) == 'l' &&
+            static_cast<char>(p[k + 3] | 0x20) == 'e') {
+          return true;
+        }
+        if (k0 == 'r' &&
+            static_cast<char>(p[k + 1] | 0x20) == 'e' &&
+            static_cast<char>(p[k + 2] | 0x20) == 'a' &&
+            static_cast<char>(p[k + 3] | 0x20) == 'd' &&
+            p[k + 4] == '_') {
+          return true;
+        }
+      }
+      return false;
+    }
+    return true;
+  };
+
+  if (OB_SUCC(ret) && !trimed_stmt.empty() && !ai_column::g_in_ai_column_internal && !session.is_inner() &&
+      has_intercept_keyword(trimed_stmt)) {
     std::string raw_sql = ai_column::strip_leading_sql_comments_and_ws(
         std::string(trimed_stmt.ptr(), static_cast<size_t>(trimed_stmt.length())));
     bool is_copy = file_sql::starts_with_copy_stmt(raw_sql);

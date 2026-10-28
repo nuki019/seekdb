@@ -32,6 +32,7 @@
 #include "sql/resolver/ddl/ob_trigger_source_builder.h"
 #include "pl/ob_pl_dependency_util.h"
 #include "lib/utility/ob_smart_call.h"
+#include "share/ob_server_struct.h"
 
 namespace oceanbase
 {
@@ -441,6 +442,11 @@ int ObPLPackageManager::load_sys_package_list(ObMySQLProxy &sql_proxy,
   CK (OB_NOT_NULL(sys_package_list));
   LOG_INFO("load sys package list begin", "sys package total count", sys_package_count);
   for (int i = 0; OB_SUCC(ret) && i < sys_package_count; ++i) {
+    if (GCTX.sys_package_ready_
+        && OB_NOT_NULL(sys_package_list[i].package_name)
+        && 0 == ObString(sys_package_list[i].package_name).case_compare("dbms_ai_service")) {
+      continue;
+    }
     OZ (load_sys_package(sql_proxy, sys_package_list[i], from_file));
   }
   if (OB_FAIL(ret)) {

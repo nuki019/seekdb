@@ -102,7 +102,7 @@ int ObSystemPackageLoadTask::load_system_package_()
       } else {
       }
     } else {
-      const common::ObString ai_pkg_name("dbms_ai_service");
+      common::ObString ai_pkg_name("dbms_ai_service");
       if (OB_SUCC(pl::ObPLPackageManager::load_sys_package(*sql_proxy, ai_pkg_name, false/*from_file*/))) {
         GCTX.sys_package_ready_ = true;
       }

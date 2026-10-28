@@ -367,6 +367,18 @@ int ObSRDaaTIterImpl::filter_on_demand(const int64_t count, const double relevan
       relevance_proj_datum.set_double(relevance);
       relevance_proj_expr->get_evaluated_flags(*eval_ctx).set(count);
       relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+      if (count > 0 &&
+          T_OP_GT == filter_expr->type_ &&
+          2 == filter_expr->arg_cnt_ &&
+          filter_expr->args_[0] == relevance_proj_expr &&
+          common::ObDoubleType == filter_expr->args_[1]->datum_meta_.type_ &&
+          filter_expr->args_[1]->get_evaluated_flags(*eval_ctx).at(0)) {
+        const ObDatum &rhs = filter_expr->args_[1]->locate_expr_datum(*eval_ctx, 0);
+        if (!rhs.is_null()) {
+          need_project = (relevance > rhs.get_double());
+          return OB_SUCCESS;
+        }
+      }
       ObDatum *filter_res = nullptr;
       filter_expr->clear_evaluated_flag(*eval_ctx);
       if (OB_FAIL(filter_expr->eval(*eval_ctx, filter_res))) {

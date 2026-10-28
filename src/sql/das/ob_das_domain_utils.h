@@ -62,6 +62,12 @@ private:
   uint64_t row_idx_;
   bool is_fts_index_aux_;
   bool has_more_words_;
+  bool use_cached_words_;
+  bool allow_digit_template_;
+  int64_t parser_key_len_;
+  char parser_key_buf_[192];
+  common::ObSEArray<common::ObString, 32> cached_words_;
+  common::ObSEArray<int64_t, 32> cached_word_cnts_;
   storage::ObFTParseHelper helper_;
   bool is_inited_;
 
