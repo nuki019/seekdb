@@ -136,7 +136,7 @@ protected:
   int64_t next_round_cnt_;
   void (*set_datum_func_)(ObDatum &, const ObDocIdExt &);
   // "relevance > <const>" match filter: the threshold is evaluated once per scan
-  enum GtFilterState { GT_FILTER_UNKNOWN = 0, GT_FILTER_CACHED = 1, GT_FILTER_GENERIC = 2 };
+  enum GtFilterState { GT_FILTER_UNKNOWN = 0, GT_FILTER_CACHED = 1, GT_FILTER_GENERIC = 2, BOOL_FILTER_CACHED = 3 };
   int8_t gt_filter_state_;
   double gt_filter_threshold_;
 private:

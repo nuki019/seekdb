@@ -383,6 +383,9 @@ int ObSRDaaTIterImpl::filter_on_demand(const int64_t count, const double relevan
     // relevance itself is projected later in project_results()
     need_project = relevance > gt_filter_threshold_;
     return ret;
+  } else if (BOOL_FILTER_CACHED == gt_filter_state_) {
+    need_project = (0 != relevance);
+    return ret;
   }
   ObExpr *filter_expr = iter_param_->filter_expr_;
   ObExpr *relevance_proj_expr = iter_param_->relevance_proj_expr_;
@@ -435,6 +438,14 @@ int ObSRDaaTIterImpl::try_cache_gt_filter_threshold()
   ObExpr *filter_expr = iter_param_->filter_expr_;
   ObEvalCtx *eval_ctx = iter_param_->eval_ctx_;
   if (OB_NOT_NULL(filter_expr) && OB_NOT_NULL(eval_ctx)
+      && eval_ctx->is_vectorized()
+      && T_OP_BOOL == filter_expr->type_
+      && 1 == filter_expr->arg_cnt_
+      && filter_expr->args_[0] == iter_param_->relevance_proj_expr_
+      && common::ObDoubleType == filter_expr->args_[0]->datum_meta_.type_) {
+    // natural language match filter: bool(relevance), i.e. relevance != 0 (relevance is never null)
+    gt_filter_state_ = BOOL_FILTER_CACHED;
+  } else if (OB_NOT_NULL(filter_expr) && OB_NOT_NULL(eval_ctx)
       && eval_ctx->is_vectorized()
       && T_OP_GT == filter_expr->type_
       && 2 == filter_expr->arg_cnt_
