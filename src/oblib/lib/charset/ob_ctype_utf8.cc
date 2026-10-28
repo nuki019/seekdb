@@ -372,6 +372,28 @@ int __attribute__ ((noinline))  ob_strnncollsp_utf8mb4_help(
   return 0;
 }
 
+// Sort weights of the 128 ASCII code points, computed with the same ob_tosort_unicode() the
+// generic loop uses (so results are identical), cached per thread for the last charset used.
+struct ObUtf8mb4AsciiSortWeights
+{
+  const ObCharsetInfo *cs_;
+  ob_wc_t w_[128];
+};
+
+static inline const ob_wc_t *ob_utf8mb4_ascii_sort_weights(const ObCharsetInfo *cs)
+{
+  static thread_local ObUtf8mb4AsciiSortWeights cache = {nullptr, {0}};
+  if (OB_UNLIKELY(cache.cs_ != cs)) {
+    for (int c = 0; c < 128; ++c) {
+      ob_wc_t wc = static_cast<ob_wc_t>(c);
+      ob_tosort_unicode(cs->caseinfo, &wc, cs->state);
+      cache.w_[c] = wc;
+    }
+    cache.cs_ = cs;
+  }
+  return cache.w_;
+}
+
 static int ob_strnncollsp_utf8mb4(const ObCharsetInfo *cs,
                        const unsigned char *src, size_t srclen,
                        const unsigned char *dst, size_t dstlen,
@@ -381,7 +403,19 @@ static int ob_strnncollsp_utf8mb4(const ObCharsetInfo *cs,
   ob_wc_t src_wc = 0, dst_wc = 0;
   const unsigned char *se= src + srclen, *te= dst + dstlen;
   ObUnicaseInfo *uni_plane= cs->caseinfo;
+  const ob_wc_t *ascii_w = ob_utf8mb4_ascii_sort_weights(cs);
   while ( src < se && dst < te ) {
+    if (*src < 0x80 && *dst < 0x80) {
+      // single-byte code points decode to themselves; compare their sort weights directly
+      const ob_wc_t sw = ascii_w[*src];
+      const ob_wc_t dw = ascii_w[*dst];
+      if (sw != dw) {
+        return sw > dw ? 1 : -1;
+      }
+      ++src;
+      ++dst;
+      continue;
+    }
     int s_res= ob_mb_wc_utf8mb4(cs, &src_wc, src, se);
     int t_res= ob_mb_wc_utf8mb4(cs, &dst_wc, dst, te);
     if ( s_res <= 0 || t_res <= 0 ) {

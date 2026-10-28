@@ -376,8 +376,15 @@ struct ObDatumStrCmpImpl
   static int OB_INLINE cmp(const ObDatum &l, const ObDatum &r, int &cmp_ret,
                            const ObCollationType cs, const bool with_end_space)
   {
-    cmp_ret = ObCharset::strcmpsp(cs, l.ptr_, l.len_, r.ptr_, r.len_, with_end_space);
-    cmp_ret = cmp_ret > 0 ? 1 : (cmp_ret < 0 ? -1 : 0);
+    if (CS_TYPE_BINARY == cs && (nullptr != l.ptr_ || 0 == l.len_) && (nullptr != r.ptr_ || 0 == r.len_)) {
+      // binary collation strnncollsp is memcmp then length (no pad, end space flag unused)
+      const uint32_t len = l.len_ < r.len_ ? l.len_ : r.len_;
+      const int c = len > 0 ? MEMCMP(l.ptr_, r.ptr_, len) : 0;
+      cmp_ret = 0 != c ? (c > 0 ? 1 : -1) : (l.len_ > r.len_ ? 1 : (l.len_ < r.len_ ? -1 : 0));
+    } else {
+      cmp_ret = ObCharset::strcmpsp(cs, l.ptr_, l.len_, r.ptr_, r.len_, with_end_space);
+      cmp_ret = cmp_ret > 0 ? 1 : (cmp_ret < 0 ? -1 : 0);
+    }
     return OB_SUCCESS;
   }
 };
