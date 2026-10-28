@@ -412,6 +412,7 @@ ObTextRetrievalDaaTTokenIter::ObTextRetrievalDaaTTokenIter()
     relevance_(),
     doc_id_(),
     cmp_func_(nullptr),
+    id_cmp_(),
     is_inited_(false)
 {
 }
@@ -435,8 +436,12 @@ int ObTextRetrievalDaaTTokenIter::init(const ObTextRetrievalScanIterParam &iter_
       max_batch_size_ = OB_MAX(iter_param.eval_ctx_->max_batch_size_, 1);
       common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(inv_scan_domain_id_col_->datum_meta_.type_, CS_TYPE_BINARY);
       cmp_func_ = basic_funcs->null_first_cmp_;
+      ObObjMeta id_meta;
+      id_meta.set_type(inv_scan_domain_id_col_->datum_meta_.type_);
+      id_meta.set_collation_type(CS_TYPE_BINARY);
       if (OB_ISNULL(cmp_func_)) {
         ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(id_cmp_.init(id_meta))) {
       } else if (FALSE_IT(relevance_.set_allocator(allocator_))) {
       } else if (OB_FAIL(relevance_.init(max_batch_size_))) {
       } else if (OB_FAIL(relevance_.prepare_allocate(max_batch_size_))) {
@@ -566,8 +571,7 @@ int ObTextRetrievalDaaTTokenIter::advance_to(const ObDatum &id_datum)
   }
   while (OB_SUCC(ret) && !find) {
     if (cur_idx_ < count_) {
-      if (OB_FAIL(cmp_func_(
-              id_datum, doc_id_[cur_idx_].get_datum(), result, nullptr))) {
+      if (OB_FAIL(id_cmp_.compare(id_datum, doc_id_.get_data()[cur_idx_].get_datum(), result))) {
       } else if (result <= 0) {
         find = true;
       } else {
@@ -581,8 +585,7 @@ int ObTextRetrievalDaaTTokenIter::advance_to(const ObDatum &id_datum)
       }
     } else if (cur_idx_ != 0) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(cmp_func_(
-                   id_datum, doc_id_[cur_idx_].get_datum(), result, nullptr))) {
+    } else if (OB_FAIL(id_cmp_.compare(id_datum, doc_id_.get_data()[cur_idx_].get_datum(), result))) {
     } else if (result <= 0) {
       find = true;
     } else {
