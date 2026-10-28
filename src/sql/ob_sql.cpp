@@ -5193,7 +5193,7 @@ static void ai_worker_loop()
   static const uint64_t PROCESS_OWNER_ID = 1;
   while (true) {
     int ret = OB_SUCCESS;
-    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
     if (!g_ai_meta_tables_ready.load(std::memory_order_acquire)
         || OB_ISNULL(GCTX.sql_proxy_)
         || !GCTX.sql_proxy_->is_inited()) {
@@ -5301,6 +5301,44 @@ static bool find_matching_paren(const std::string &s, size_t open_pos, size_t &c
   return false;
 }
 
+static std::string strip_leading_sql_comments_and_ws(const std::string &s)
+{
+  size_t i = 0;
+  while (i < s.size()) {
+    while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) {
+      ++i;
+    }
+    if (i >= s.size()) {
+      break;
+    }
+    if (s[i] == '#') {
+      while (i < s.size() && s[i] != '\n') {
+        ++i;
+      }
+    } else if (i + 1 < s.size() && s[i] == '-' && s[i + 1] == '-'
+               && (i + 2 >= s.size() || std::isspace(static_cast<unsigned char>(s[i + 2])) || s[i + 2] == '-')) {
+      i += 2;
+      while (i < s.size() && s[i] != '\n') {
+        ++i;
+      }
+    } else if (i + 1 < s.size() && s[i] == '/' && s[i + 1] == '*'
+               && !(i + 2 < s.size() && s[i + 2] == '!')) {
+      i += 2;
+      while (i + 1 < s.size() && !(s[i] == '*' && s[i + 1] == '/')) {
+        ++i;
+      }
+      if (i + 1 < s.size()) {
+        i += 2;
+      } else {
+        i = s.size();
+      }
+    } else {
+      break;
+    }
+  }
+  return s.substr(i);
+}
+
 static size_t find_top_level_keyword_pair(const std::string &s,
                                           const std::string &kw1_low,
                                           const std::string &kw2_low,
@@ -5324,6 +5362,30 @@ static size_t find_top_level_keyword_pair(const std::string &s,
     }
     if (c == '\'' || c == '"' || c == '`') {
       quote = c;
+      continue;
+    }
+    if (c == '#') {
+      while (i < s.size() && s[i] != '\n') {
+        ++i;
+      }
+      continue;
+    }
+    if (i + 1 < s.size() && c == '-' && s[i + 1] == '-'
+        && (i + 2 >= s.size() || std::isspace(static_cast<unsigned char>(s[i + 2])) || s[i + 2] == '-')) {
+      i += 2;
+      while (i < s.size() && s[i] != '\n') {
+        ++i;
+      }
+      continue;
+    }
+    if (i + 1 < s.size() && c == '/' && s[i + 1] == '*' && !(i + 2 < s.size() && s[i + 2] == '!')) {
+      i += 2;
+      while (i + 1 < s.size() && !(s[i] == '*' && s[i + 1] == '/')) {
+        ++i;
+      }
+      if (i + 1 < s.size()) {
+        ++i;
+      }
       continue;
     }
     if (c == '(') {
@@ -5388,6 +5450,30 @@ static size_t find_top_level_keyword(const std::string &s,
     }
     if (c == '\'' || c == '"' || c == '`') {
       quote = c;
+      continue;
+    }
+    if (c == '#') {
+      while (i < s.size() && s[i] != '\n') {
+        ++i;
+      }
+      continue;
+    }
+    if (i + 1 < s.size() && c == '-' && s[i + 1] == '-'
+        && (i + 2 >= s.size() || std::isspace(static_cast<unsigned char>(s[i + 2])) || s[i + 2] == '-')) {
+      i += 2;
+      while (i < s.size() && s[i] != '\n') {
+        ++i;
+      }
+      continue;
+    }
+    if (i + 1 < s.size() && c == '/' && s[i + 1] == '*' && !(i + 2 < s.size() && s[i + 2] == '!')) {
+      i += 2;
+      while (i + 1 < s.size() && !(s[i] == '*' && s[i + 1] == '/')) {
+        ++i;
+      }
+      if (i + 1 < s.size()) {
+        ++i;
+      }
       continue;
     }
     if (c == '(') {
@@ -5809,6 +5895,7 @@ static int handle_create_table_ai_column(ObSql *sql_engine,
   int ret = exec_session_sql(sql_engine, pc_service, session, context, rewritten_create, NULL, true);
   if (OB_SUCC(ret)) {
     ret = persist_ai_column_metadata(db_name, table_name, ai_defs);
+    session.get_cached_schema_guard_info().reset();
   }
   return ret;
 }
@@ -6024,7 +6111,9 @@ static int handle_alter_table_ai_column(ObSql *sql_engine,
       return ret;
     }
     std::vector<ParsedAiColumnDef> defs{def};
-    return persist_ai_column_metadata(db_name, table_name, defs);
+    ret = persist_ai_column_metadata(db_name, table_name, defs);
+    session.get_cached_schema_guard_info().reset();
+    return ret;
   }
 
   return OB_SUCCESS;
@@ -6508,8 +6597,9 @@ OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, 
   bool is_begin_commit_stmt = false;
   bool is_file_sql_rewritten = false;
 
-  if (OB_SUCC(ret) && !trimed_stmt.empty()) {
-    std::string raw_sql(trimed_stmt.ptr(), static_cast<size_t>(trimed_stmt.length()));
+  if (OB_SUCC(ret) && !trimed_stmt.empty() && !ai_column::g_in_ai_column_internal && !session.is_inner()) {
+    std::string raw_sql = ai_column::strip_leading_sql_comments_and_ws(
+        std::string(trimed_stmt.ptr(), static_cast<size_t>(trimed_stmt.length())));
     bool is_copy = file_sql::starts_with_copy_stmt(raw_sql);
     bool is_desc_select = file_sql::starts_with_describe_select(raw_sql);
     std::vector<file_sql::FileFuncMatch> func_matches;

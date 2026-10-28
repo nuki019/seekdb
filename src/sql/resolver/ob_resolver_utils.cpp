@@ -5296,9 +5296,20 @@ int ObResolverUtils::wait_for_sys_package_ready(ObSQLSessionInfo &session_info)
   int ret = OB_SUCCESS;
   if (config::_enable_async_load_sys_package() && !GCTX.sys_package_ready_
       && session_info.is_user_session() && share::server_is_write_enabled()) {
-    const int64_t retry_interval_us = 100L * 1000L; // 100ms
+    const int64_t retry_interval_us = 20L * 1000L; // 20ms
     bool waited = false;
+    int64_t query_timeout = 10000000L;
+    (void)session_info.get_query_timeout(query_timeout);
+    if (query_timeout < 10000000L) {
+      query_timeout = 10000000L;
+    }
     while (!GCTX.sys_package_ready_ && OB_SUCC(ret)) {
+      const int64_t new_timeout_ts = ObTimeUtility::current_time() + query_timeout;
+      THIS_WORKER.set_timeout_ts(new_timeout_ts);
+      if (NULL != session_info.get_cur_exec_ctx()
+          && NULL != session_info.get_cur_exec_ctx()->get_physical_plan_ctx()) {
+        session_info.get_cur_exec_ctx()->get_physical_plan_ctx()->set_timeout_timestamp(new_timeout_ts);
+      }
       if (NULL != session_info.get_cur_exec_ctx() && OB_FAIL(session_info.get_cur_exec_ctx()->check_status())) {
       } else {
         if (!waited) {
@@ -5308,6 +5319,13 @@ int ObResolverUtils::wait_for_sys_package_ready(ObSQLSessionInfo &session_info)
         ob_usleep(retry_interval_us);
       }
     }
+    const int64_t final_timeout_ts = ObTimeUtility::current_time() + query_timeout;
+    THIS_WORKER.set_timeout_ts(final_timeout_ts);
+    if (NULL != session_info.get_cur_exec_ctx()
+        && NULL != session_info.get_cur_exec_ctx()->get_physical_plan_ctx()) {
+      session_info.get_cur_exec_ctx()->get_physical_plan_ctx()->set_timeout_timestamp(final_timeout_ts);
+    }
+    session_info.set_query_start_time(ObTimeUtility::current_time());
     if (OB_FAIL(ret)) {
     } else if (!GCTX.sys_package_ready_) {
       LOG_WARN("sys package not ready after waiting");
