@@ -62,6 +62,10 @@ static void sk_host_tensor(DLManagedTensor* t, void* data, long* shape, uint8_t 
   t->manager_ctx = 0; t->deleter = 0;
 }
 
+/* seekdb_cuvs_graph.hip: CAGRA graph (n x kout, host) from GPU k-NN search + pruning. */
+int sk_build_cagra_graph(cuvsResources_t res, const float* base, long n, long dim,
+                         int kin, int kout, unsigned int* out_graph);
+
 void* seekdb_cuvs_build(const float* base, long n, long dim)
 {
   sk_cuvs_index* h = (sk_cuvs_index*)calloc(1, sizeof(*h));
@@ -82,7 +86,27 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   h->ip->intermediate_graph_degree = 256;
   h->ip->nn_descent_niter = 100;
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
-  if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
+  {
+    /* Build the CAGRA graph with GPU k-NN search + CAGRA pruning (seekdb_cuvs_graph.hip)
+     * and attach it with the dataset; fall back to the stock NN-descent build if that fails. */
+    long gs[2] = {n, (long)h->ip->graph_degree};
+    unsigned int* graph = (unsigned int*)malloc(sizeof(unsigned int) * n * h->ip->graph_degree);
+    DLManagedTensor gt;
+    int ok = graph != NULL &&
+             sk_build_cagra_graph(h->res, base, n, dim, (int)h->ip->intermediate_graph_degree,
+                                  (int)h->ip->graph_degree, graph) == 0;
+    if (ok) {
+      sk_host_tensor(&gt, graph, gs, kDLUInt, 32);
+      ok = cuvsCagraIndexFromArgs(h->res, L2Expanded, &gt, &dset, h->idx) == CUVS_SUCCESS &&
+           cuvsStreamSync(h->res) == CUVS_SUCCESS;
+    }
+    free(graph);
+    if (!ok) {
+      cuvsCagraIndexDestroy(h->idx);
+      if (cuvsCagraIndexCreate(&h->idx) != CUVS_SUCCESS) goto fail_ip;
+      if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
+    }
+  }
   h->n = n; h->dim = dim;
   return h;
 
@@ -116,11 +140,12 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
     nt=qt; nt.dl_tensor.data=h->nd; nt.dl_tensor.dtype.code=kDLUInt; nt.dl_tensor.shape=nsh;
     dt=qt; dt.dl_tensor.data=h->dd; dt.dl_tensor.dtype.code=kDLFloat; dt.dl_tensor.shape=dsh;
     {
-      /* Same search parameters as before; only the params object itself is reused. */
+      /* Same itopk as before; search_width 8 expands more parents per iteration, which
+       * converges in fewer iterations (higher single-query throughput, equal recall). */
       size_t required_itopk = (size_t)topk * 4;
       if (required_itopk < 512) required_itopk = 512;
       h->sp->itopk_size = h->sp_default_itopk < required_itopk ? required_itopk : h->sp_default_itopk;
-      h->sp->search_width = 4;
+      h->sp->search_width = 8;
     }
     cuvsFilter f; f.type=NO_FILTER; f.addr=(uintptr_t)0;
     if (cuvsCagraSearch(h->res, h->sp, h->idx, &qt, &nt, &dt, f) != CUVS_SUCCESS) { rc=15; goto done; }
