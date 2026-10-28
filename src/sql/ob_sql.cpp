@@ -4630,7 +4630,9 @@ static int exec_session_sql(ObSql *sql_engine,
     return OB_ALLOCATE_MEMORY_FAILED;
   }
   ObExecContext *saved_exec_ctx = session.get_cur_exec_ctx();
-  session.set_cur_exec_ctx(NULL);
+  // Run the internal statement as a top-level one (not nested) so it keeps its own
+  // autocommit semantics; the outer exec ctx is restored afterwards.
+  ObSQLSessionInfo::ExecCtxSessionRegister detach_outer_ctx(session, NULL);
   {
     LinkExecCtxGuard inner_guard(session, inner_rs->get_exec_context());
     inner_rs->get_exec_context().get_sql_exec_ctx().schema_service_ = GCTX.schema_service_;
@@ -4674,7 +4676,7 @@ static int exec_session_sql(ObSql *sql_engine,
       }
     }
   }
-  session.set_cur_exec_ctx(saved_exec_ctx);
+  ObSQLSessionInfo::ExecCtxSessionRegister restore_outer_ctx(session, saved_exec_ctx);
   inner_rs->~ObResultSet();
   if (refresh_schema_after) {
     (void)session.get_cached_schema_guard_info().refresh_runtime_schema_guard();
