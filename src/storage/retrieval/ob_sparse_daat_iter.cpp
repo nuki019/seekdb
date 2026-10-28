@@ -97,7 +97,9 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     buffered_relevances_(),
     next_round_iter_idxes_(),
     next_round_cnt_(0),
-    set_datum_func_(nullptr)
+    set_datum_func_(nullptr),
+    gt_filter_state_(GT_FILTER_UNKNOWN),
+    gt_filter_threshold_(0.0)
 {
 }
 
@@ -193,6 +195,7 @@ void ObSRDaaTIterImpl::reuse(const bool switch_tablet)
   }
   input_row_cnt_ = 0;
   output_row_cnt_ = 0;
+  gt_filter_state_ = GT_FILTER_UNKNOWN; // exec params may change on rescan
 }
 
   int ObSRDaaTIterImpl::get_query_max_score(double &score)
@@ -290,10 +293,16 @@ int ObSRDaaTIterImpl::fill_merge_heap()
 {
   int ret = OB_SUCCESS;
   ObSRMergeItem item;
+  // hot loop: index the fixed-size arrays directly (indexes come from next_round_iter_idxes_,
+  // which only ever holds valid dim iter positions)
+  ObISRDaaTDimIter *const *dim_iters = dim_iters_->get_data();
+  const int64_t *round_idxes = next_round_iter_idxes_.get_data();
+  const ObDatum **domain_ids = iter_domain_ids_.get_data();
+  const double *dim_weights = OB_NOT_NULL(iter_param_->dim_weights_) ? iter_param_->dim_weights_->get_data() : nullptr;
   for (int64_t i = 0; OB_SUCC(ret) && i < next_round_cnt_; ++i) {
-    const int64_t iter_idx = next_round_iter_idxes_[i];
+    const int64_t iter_idx = round_idxes[i];
     ObISRDaaTDimIter *dim_iter = nullptr;
-    if (OB_ISNULL(dim_iter = dim_iters_->at(iter_idx))) {
+    if (OB_ISNULL(dim_iter = dim_iters[iter_idx])) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(dim_iter->get_next_row())) {
       if (OB_UNLIKELY(OB_ITER_END != ret)) {
@@ -302,8 +311,8 @@ int ObSRDaaTIterImpl::fill_merge_heap()
         ret = OB_SUCCESS;
       }
     } else if (OB_FAIL(dim_iter->get_curr_score(item.relevance_))) {
-    } else if (OB_NOT_NULL(iter_param_->dim_weights_) && FALSE_IT(item.relevance_ = item.relevance_ * iter_param_->field_boost_ * iter_param_->dim_weights_->at(iter_idx))) {
-    } else if (OB_FAIL(dim_iter->get_curr_id(iter_domain_ids_[iter_idx]))) {
+    } else if (nullptr != dim_weights && FALSE_IT(item.relevance_ = item.relevance_ * iter_param_->field_boost_ * dim_weights[iter_idx])) {
+    } else if (OB_FAIL(dim_iter->get_curr_id(domain_ids[iter_idx]))) {
     } else if (FALSE_IT(item.iter_idx_ = iter_idx)) {
     } else if (OB_FAIL(merge_heap_->push(item))) {
     } else {
@@ -340,12 +349,12 @@ int ObSRDaaTIterImpl::collect_dims_by_id(const ObDatum *&id_datum, double &relev
     } else if (FALSE_IT(iter_idx = top_item->iter_idx_)) {
     } else if (OB_FAIL(merge_heap_->pop())) {
     } else {
-      next_round_iter_idxes_[next_round_cnt_++] = iter_idx;
+      next_round_iter_idxes_.get_data()[next_round_cnt_++] = iter_idx;
     }
   }
 
   if (OB_SUCC(ret)) {
-    id_datum = iter_domain_ids_[iter_idx];
+    id_datum = iter_domain_ids_.get_data()[iter_idx];
     if (OB_ISNULL(id_datum)) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(relevance_collector_->get_result(relevance, got_valid_id))) {
@@ -367,6 +376,13 @@ int ObSRDaaTIterImpl::filter_on_demand(const int64_t count, const double relevan
   if (!iter_param_->need_filter()) {
     need_project = true;
     return OB_SUCCESS;
+  }
+  if (OB_UNLIKELY(GT_FILTER_UNKNOWN == gt_filter_state_) && OB_FAIL(try_cache_gt_filter_threshold())) {
+    return ret;
+  } else if (GT_FILTER_CACHED == gt_filter_state_) {
+    // relevance itself is projected later in project_results()
+    need_project = relevance > gt_filter_threshold_;
+    return ret;
   }
   ObExpr *filter_expr = iter_param_->filter_expr_;
   ObExpr *relevance_proj_expr = iter_param_->relevance_proj_expr_;
@@ -408,6 +424,32 @@ int ObSRDaaTIterImpl::filter_on_demand(const int64_t count, const double relevan
     ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
     relevance_proj_datum.set_double(relevance);
     relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+  }
+  return ret;
+}
+
+int ObSRDaaTIterImpl::try_cache_gt_filter_threshold()
+{
+  int ret = OB_SUCCESS;
+  gt_filter_state_ = GT_FILTER_GENERIC;
+  ObExpr *filter_expr = iter_param_->filter_expr_;
+  ObEvalCtx *eval_ctx = iter_param_->eval_ctx_;
+  if (OB_NOT_NULL(filter_expr) && OB_NOT_NULL(eval_ctx)
+      && eval_ctx->is_vectorized()
+      && T_OP_GT == filter_expr->type_
+      && 2 == filter_expr->arg_cnt_
+      && filter_expr->args_[0] == iter_param_->relevance_proj_expr_
+      && common::ObDoubleType == filter_expr->args_[1]->datum_meta_.type_
+      && filter_expr->args_[1]->is_const_expr()) {
+    ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
+    guard.set_batch_idx(0);
+    ObDatum *rhs = nullptr;
+    if (OB_FAIL(filter_expr->args_[1]->eval(*eval_ctx, rhs))) {
+      LOG_WARN("failed to eval match filter threshold", K(ret));
+    } else if (OB_NOT_NULL(rhs) && !rhs->is_null()) {
+      gt_filter_threshold_ = rhs->get_double();
+      gt_filter_state_ = GT_FILTER_CACHED;
+    }
   }
   return ret;
 }
