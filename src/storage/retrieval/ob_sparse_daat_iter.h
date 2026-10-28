@@ -52,8 +52,37 @@ private:
     OB_ASSERT(nullptr != datum);
     return *datum;
   }
+  enum IdCmpMode
+  {
+    ID_CMP_GENERIC = 0,
+    ID_CMP_BINARY_STR = 1,   // binary collation string (e.g. docid): memcmp + length
+    ID_CMP_UINT64 = 2,
+    ID_CMP_INT64 = 3,
+  };
+  static inline int fast_cmp(const IdCmpMode mode, const ObDatum &l, const ObDatum &r)
+  {
+    int res = 0;
+    if (OB_UNLIKELY(l.is_null() || r.is_null())) {
+      res = l.is_null() == r.is_null() ? 0 : (l.is_null() ? -1 : 1);  // null first
+    } else if (ID_CMP_UINT64 == mode) {
+      const uint64_t lv = l.get_uint64();
+      const uint64_t rv = r.get_uint64();
+      res = lv < rv ? -1 : (lv > rv ? 1 : 0);
+    } else if (ID_CMP_INT64 == mode) {
+      const int64_t lv = l.get_int();
+      const int64_t rv = r.get_int();
+      res = lv < rv ? -1 : (lv > rv ? 1 : 0);
+    } else {
+      const uint32_t ll = l.len_;
+      const uint32_t rl = r.len_;
+      const int c = MEMCMP(l.ptr_, r.ptr_, ll < rl ? ll : rl);
+      res = 0 != c ? (c < 0 ? -1 : 1) : (ll < rl ? -1 : (ll > rl ? 1 : 0));
+    }
+    return res;
+  }
 private:
   common::ObDatumCmpFuncType cmp_func_;
+  IdCmpMode id_cmp_mode_;
   // TODO: if memory lifetime of docid datum is guaranteed by dim_iters, we can use pointer to datum directly
   //       and avoid deep copy into merge heap here
   const ObFixedArray<const ObDatum *, ObIAllocator> *iter_ids_;

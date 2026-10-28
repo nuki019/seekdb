@@ -25,6 +25,7 @@ namespace storage
 
 ObSRMergeCmp::ObSRMergeCmp()
   : cmp_func_(nullptr),
+    id_cmp_mode_(ID_CMP_GENERIC),
     iter_ids_(nullptr),
     is_inited_(false)
 {
@@ -41,6 +42,18 @@ int ObSRMergeCmp::init(
     iter_ids_ = iter_ids;
     common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(id_meta.type_, id_meta.cs_type_);
     cmp_func_ = basic_funcs->null_first_cmp_;
+    // Domain ids are compared once per posting entry while merging; avoid the generic
+    // collation-aware compare for the common id types whose order is plain byte/number order.
+    if (common::ObUInt64Type == id_meta.type_) {
+      id_cmp_mode_ = ID_CMP_UINT64;
+    } else if (common::ObIntType == id_meta.type_) {
+      id_cmp_mode_ = ID_CMP_INT64;
+    } else if ((common::ObVarcharType == id_meta.type_ || common::ObCharType == id_meta.type_)
+               && common::CS_TYPE_BINARY == id_meta.cs_type_) {
+      id_cmp_mode_ = ID_CMP_BINARY_STR;
+    } else {
+      id_cmp_mode_ = ID_CMP_GENERIC;
+    }
     if (OB_ISNULL(cmp_func_)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
@@ -58,6 +71,8 @@ int ObSRMergeCmp::cmp(
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (ID_CMP_GENERIC != id_cmp_mode_) {
+    cmp_ret = fast_cmp(id_cmp_mode_, *iter_ids_->get_data()[l.iter_idx_], *iter_ids_->get_data()[r.iter_idx_]);
   } else {
     int tmp_ret = 0;
     if (OB_FAIL(cmp_func_(
