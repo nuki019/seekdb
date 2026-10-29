@@ -108,7 +108,6 @@ private:
   int init_topk_limit();
   int init_block_max_iter_param();
   int init_doc_length_est_param();
-  int do_real_table_scan();
 private:
   static const int64_t INV_IDX_ROWKEY_COL_CNT = 2;
 private:
@@ -147,12 +146,6 @@ private:
     };
     uint32_t flags_;
   };
-  int64_t fts_cache_slot_;
-  int64_t fts_cache_cursor_;
-  uint64_t fts_cache_sig_;
-  int64_t fts_cache_epoch_;
-  bool fts_cache_hit_;
-  bool fts_cache_recording_;
   bool check_rangekey_inited_;
   bool inv_idx_tablet_switched_;
   bool is_inited_;

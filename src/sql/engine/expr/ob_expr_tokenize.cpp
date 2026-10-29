@@ -35,7 +35,6 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/engine/expr/ob_expr_json_func_helper.h" // file not self-contained, there're logs inside.
-#include <string>
 
 namespace oceanbase
 {
@@ -43,20 +42,6 @@ namespace sql
 {
 namespace
 {
-struct TlTokenizeCacheSlot
-{
-  ObCollationType cs_type_{CS_TYPE_INVALID};
-  bool has_lob_header_{false};
-  bool valid_{false};
-  std::string parser_name_;
-  std::string fulltext_;
-  std::string packed_res_;
-};
-
-static constexpr int64_t TL_TOKENIZE_CACHE_SIZE = 8;
-thread_local TlTokenizeCacheSlot g_tl_tokenize_cache[TL_TOKENIZE_CACHE_SIZE];
-thread_local uint64_t g_tl_tokenize_cache_hand = 0;
-
 class ObExprTokenizeCtx : public ObExprOperatorCtx
 {
 public:
@@ -91,59 +76,6 @@ ObExprTokenize::~ObExprTokenize() {}
 int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_datum)
 {
   int ret = OB_SUCCESS;
-
-  bool cacheable_call = false;
-  ObCollationType call_cs_type = CS_TYPE_INVALID;
-  const bool call_has_lob = expr.obj_meta_.has_lob_header();
-  ObString call_ft_str;
-  ObString call_pn_str;
-
-  if (expr.arg_cnt_ >= 1 && expr.arg_cnt_ <= 2) {
-    ObDatum *ft_datum = nullptr;
-    ObDatum *pn_datum = nullptr;
-    if (OB_SUCC(expr.args_[0]->eval(ctx, ft_datum)) && OB_NOT_NULL(ft_datum) && !ft_datum->is_null()) {
-      bool pn_ok = true;
-      if (expr.arg_cnt_ == 1) {
-        call_pn_str = ObString::make_string(OB_DEFAULT_FULLTEXT_PARSER_NAME);
-      } else if (OB_FAIL(expr.args_[1]->eval(ctx, pn_datum)) || OB_ISNULL(pn_datum)) {
-        pn_ok = false;
-        ret = OB_SUCCESS;
-      } else if (pn_datum->is_null()) {
-        call_pn_str = ObString::make_string(OB_DEFAULT_FULLTEXT_PARSER_NAME);
-      } else {
-        call_pn_str = pn_datum->get_string().trim();
-      }
-      if (pn_ok) {
-        call_ft_str = ft_datum->get_string();
-        call_cs_type = expr.args_[0]->obj_meta_.get_collation_type();
-        if (call_ft_str.length() > 0 && call_ft_str.length() <= 4096 &&
-            call_pn_str.length() > 0 && call_pn_str.length() <= 64) {
-          cacheable_call = true;
-          for (int64_t i = 0; i < TL_TOKENIZE_CACHE_SIZE; ++i) {
-            const TlTokenizeCacheSlot &slot = g_tl_tokenize_cache[i];
-            if (slot.valid_ &&
-                slot.cs_type_ == call_cs_type &&
-                slot.has_lob_header_ == call_has_lob &&
-                static_cast<int64_t>(slot.parser_name_.size()) == call_pn_str.length() &&
-                static_cast<int64_t>(slot.fulltext_.size()) == call_ft_str.length() &&
-                0 == MEMCMP(slot.parser_name_.data(), call_pn_str.ptr(), call_pn_str.length()) &&
-                0 == MEMCMP(slot.fulltext_.data(), call_ft_str.ptr(), call_ft_str.length())) {
-              const int64_t res_len = static_cast<int64_t>(slot.packed_res_.size());
-              char *res_buf = expr.get_str_res_mem(ctx, res_len);
-              if (OB_NOT_NULL(res_buf)) {
-                MEMCPY(res_buf, slot.packed_res_.data(), res_len);
-                expr_datum.set_string(res_buf, static_cast<int32_t>(res_len));
-                return OB_SUCCESS;
-              }
-              break;
-            }
-          }
-        }
-      }
-    } else {
-      ret = OB_SUCCESS;
-    }
-  }
 
   ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
   common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
@@ -205,15 +137,6 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
     }
     if (OB_SUCC(ret)) {
       ret = ObJsonExprHelper::pack_json_res(expr, ctx, temp_allocator, json_result, expr_datum);
-      if (OB_SUCC(ret) && cacheable_call && !expr_datum.is_null() && expr_datum.len_ > 0 && expr_datum.len_ <= 16384) {
-        TlTokenizeCacheSlot &slot = g_tl_tokenize_cache[g_tl_tokenize_cache_hand++ % TL_TOKENIZE_CACHE_SIZE];
-        slot.cs_type_ = call_cs_type;
-        slot.has_lob_header_ = call_has_lob;
-        slot.parser_name_.assign(call_pn_str.ptr(), static_cast<size_t>(call_pn_str.length()));
-        slot.fulltext_.assign(call_ft_str.ptr(), static_cast<size_t>(call_ft_str.length()));
-        slot.packed_res_.assign(expr_datum.ptr_, static_cast<size_t>(expr_datum.len_));
-        slot.valid_ = true;
-      }
     }
   }
 
