@@ -24,6 +24,9 @@ typedef struct {
   float*                 qd;  size_t qd_cap;
   unsigned*              nd;  size_t nd_cap;
   float*                 dd;  size_t dd_cap;
+  /* Device graph and dataset that idx views (zero-copy) when built by seekdb_cuvs_graph.hip. */
+  unsigned int*          d_graph;
+  float*                 d_data;
 } sk_cuvs_index;
 
 static void sk_init_search_state(sk_cuvs_index* h)
@@ -62,9 +65,16 @@ static void sk_host_tensor(DLManagedTensor* t, void* data, long* shape, uint8_t 
   t->manager_ctx = 0; t->deleter = 0;
 }
 
-/* seekdb_cuvs_graph.hip: CAGRA graph (n x kout, host) from GPU k-NN search + pruning. */
+/* seekdb_cuvs_graph.hip: CAGRA graph (n x kout, device, caller-owned) from GPU k-NN
+ * search + pruning. */
 int sk_build_cagra_graph(cuvsResources_t res, const float* base, long n, long dim,
-                         int kin, int kout, unsigned int* out_graph);
+                         int kin, int kout, unsigned int** graph_out);
+
+/* Degree of graphs built by sk_build_cagra_graph. Above the stock 128: the extra edges
+ * keep Recall@100 at or above the NN-descent graph on hard data while search stays faster. */
+#ifndef SK_GRAPH_DEGREE
+#define SK_GRAPH_DEGREE 160
+#endif
 
 void* seekdb_cuvs_build(const float* base, long n, long dim)
 {
@@ -88,20 +98,26 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   {
     /* Build the CAGRA graph with GPU k-NN search + CAGRA pruning (seekdb_cuvs_graph.hip)
-     * and attach it with the dataset; fall back to the stock NN-descent build if that fails. */
-    long gs[2] = {n, (long)h->ip->graph_degree};
-    unsigned int* graph = (unsigned int*)malloc(sizeof(unsigned int) * n * h->ip->graph_degree);
-    DLManagedTensor gt;
-    int ok = graph != NULL &&
-             sk_build_cagra_graph(h->res, base, n, dim, (int)h->ip->intermediate_graph_degree,
-                                  (int)h->ip->graph_degree, graph) == 0;
+     * and attach it with a device copy of the dataset. With device inputs the index views
+     * both buffers instead of copying them; the handle owns them. Fall back to the stock
+     * NN-descent build if anything fails. */
+    long gs[2] = {n, SK_GRAPH_DEGREE};
+    DLManagedTensor gt, dt;
+    int ok = sk_build_cagra_graph(h->res, base, n, dim, (int)h->ip->intermediate_graph_degree,
+                                  SK_GRAPH_DEGREE, &h->d_graph) == 0 &&
+             cudaMalloc((void**)&h->d_data, sizeof(float) * n * dim) == cudaSuccess &&
+             cudaMemcpy(h->d_data, base, sizeof(float) * n * dim, cudaMemcpyHostToDevice) == cudaSuccess;
     if (ok) {
-      sk_host_tensor(&gt, graph, gs, kDLUInt, 32);
-      ok = cuvsCagraIndexFromArgs(h->res, L2Expanded, &gt, &dset, h->idx) == CUVS_SUCCESS &&
+      sk_host_tensor(&gt, h->d_graph, gs, kDLUInt, 32);
+      gt.dl_tensor.device.device_type = kDLCUDA;
+      sk_host_tensor(&dt, h->d_data, ds, kDLFloat, 32);
+      dt.dl_tensor.device.device_type = kDLCUDA;
+      ok = cuvsCagraIndexFromArgs(h->res, L2Expanded, &gt, &dt, h->idx) == CUVS_SUCCESS &&
            cuvsStreamSync(h->res) == CUVS_SUCCESS;
     }
-    free(graph);
     if (!ok) {
+      cudaFree(h->d_graph); h->d_graph = NULL;
+      cudaFree(h->d_data); h->d_data = NULL;
       cuvsCagraIndexDestroy(h->idx);
       if (cuvsCagraIndexCreate(&h->idx) != CUVS_SUCCESS) goto fail_ip;
       if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
@@ -164,6 +180,8 @@ void seekdb_cuvs_free(void* handle)
   if (!h) return;
   sk_free_search_state(h);
   cuvsCagraIndexDestroy(h->idx);
+  if (h->d_graph) cudaFree(h->d_graph);  /* viewed by idx: release after it */
+  if (h->d_data) cudaFree(h->d_data);
   cuvsCagraIndexParamsDestroy(h->ip);
   cuvsResourcesDestroy(h->res);
   free(h);
