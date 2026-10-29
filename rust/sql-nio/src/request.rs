@@ -632,9 +632,9 @@ pub unsafe extern "C" fn nio_prepare_commit(
 /// clone keeps Conn alive even when this commit clears REQUEST_BUSY and a
 /// concurrent close subsequently releases the connection-scoped owner before
 /// this function returns. The delivery callback may still be returning on the
-/// io thread; Rust retains the body for it. Empty responses complete inline;
-/// non-empty output is handed to the owning reactor so socket writes stay
-/// concentrated on the SQL-NIO threads.
+/// io thread; Rust retains the body for it. Output that the socket accepts
+/// right away completes inline; anything left over is handed to the owning
+/// reactor, which finishes the write when the socket becomes writable.
 #[no_mangle]
 pub unsafe extern "C" fn nio_commit_request(
     connection_handle: *mut NioConnectionHandle,
@@ -661,6 +661,13 @@ pub unsafe extern "C" fn nio_commit_request(
                     take_mid_request_body_for_generation_locked(&mut g, continuation.generation);
                 let released_login = g.login.take();
                 g.final_response = FinalResponseState::Committed(continuation);
+                // Try to send the final response from the worker first, like the
+                // blocking mid-response flush does. A small response usually fits
+                // in the socket buffer, which saves waking the reactor and a thread
+                // hop per request; any remainder still goes through the reactor.
+                if !g.output_is_empty() && !g.want_write && !conn.err.load(Ordering::Acquire) {
+                    flush_buffer_locked(&conn, &mut g);
+                }
 
                 let completed = take_final_completion_locked(&mut g);
                 let finished = completed

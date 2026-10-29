@@ -215,11 +215,17 @@ void ObThWorker::worker(int64_t &tid, int64_t &req_recv_timestamp, int32_t &work
   procor_.th_created();
   is_doing_ddl_ = &Thread::is_doing_ddl_;
   static constexpr int64_t POLL_INTERVAL = 100 * 1000L;
+  // A client usually sends its next statement right after reading the previous
+  // response, so a worker that just finished a request polls the queue briefly
+  // before parking on the futex. This skips the sleep/wake round trip for
+  // back-to-back statements and costs at most this long per request.
+  static constexpr int64_t SPIN_AFTER_REQUEST_US = 100L;
   // Avoid adding and deleting entities from the root node for every request, the parameters are meaningless
   CREATE_WITH_TEMP_ENTITY(RESOURCE_OWNER, OB_SERVER_RUNTIME_ID) {
     auto *pm = common::ObPageManager::thread_local_instance();
     snprintf(module_name_, MAX_MODULE_NAME_LEN, "ReqWorker");
     int64_t idle_since = 0;
+    int64_t last_request_done_time = 0;
     while (!has_set_stop()) {
       worker_level = get_worker_level();
       if (OB_NOT_NULL(runtime_)) {
@@ -265,7 +271,19 @@ void ObThWorker::worker(int64_t &tid, int64_t &req_recv_timestamp, int32_t &work
             // get request from queue and process it
             wait_start_time = ObTimeUtility::current_time();
             ret = runtime_->pop_with_idle([&]() {
-              return runtime_->get_new_request(POLL_INTERVAL, req);
+              int pop_ret = OB_ENTRY_NOT_EXIST;
+              if (last_request_done_time > 0) {
+                const int64_t spin_end_time = last_request_done_time + SPIN_AFTER_REQUEST_US;
+                while (OB_ENTRY_NOT_EXIST == (pop_ret = runtime_->get_new_request(0, req))
+                       && ObTimeUtility::current_time() < spin_end_time) {
+                  PAUSE();
+                }
+                last_request_done_time = 0;
+              }
+              if (OB_ENTRY_NOT_EXIST == pop_ret) {
+                pop_ret = runtime_->get_new_request(POLL_INTERVAL, req);
+              }
+              return pop_ret;
             }, expand);
             wait_end_time = ObTimeUtility::current_time();
           }
@@ -286,6 +304,7 @@ void ObThWorker::worker(int64_t &tid, int64_t &req_recv_timestamp, int32_t &work
               runtime_->completion_cnt_.fetch_add(1, std::memory_order_relaxed);
               query_enqueue_time_ = INT64_MAX;
               query_start_time_ = INT64_MAX;
+              last_request_done_time = ObTimeUtility::current_time();
             } else {
                 ret = OB_ERR_UNEXPECTED;
                 LOG_ERROR(
