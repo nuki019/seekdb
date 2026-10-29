@@ -211,6 +211,10 @@ int ObIndependentDag::process()
       }
       if (OB_FAIL(ret)) {
         simply_set_stop(ret); // set this dag stop to notify other threads
+        {
+          ObThreadCondGuard guard(cond_);
+          (void) cond_.broadcast();
+        }
         COMMON_LOG(WARN, "task schedule failed in this thread", K(ret), KPC(this));
       }
     }
@@ -464,6 +468,10 @@ int ObIndependentDag::deal_with_finish_task(
     if (inner_has_finished()) {
       ObIDag::ObDagStatus status = is_dag_failed() ? ObIDag::DAG_STATUS_ABORT : ObIDag::DAG_STATUS_FINISH;
       set_dag_status(status);
+      // wake up the other threads parked in wait_signal(), otherwise they only notice
+      // the final status when their cond wait times out
+      ObThreadCondGuard guard(cond_);
+      (void) cond_.broadcast();
       COMMON_LOG(INFO, "dag finished", K(ret), K_(dag_ret), K(status), "runtime", ObTimeUtility::fast_current_time() - start_time_, KPC(this));
     }
   }

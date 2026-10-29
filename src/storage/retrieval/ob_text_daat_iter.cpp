@@ -149,5 +149,22 @@ int ObTextBMWIter::init_before_wand_process()
   return ret;
 }
 
+bool ObTextBMWIter::prefer_exhaustive_search()
+{
+  bool prefer = true;
+  int64_t total_doc_cnt = 0;
+  for (int64_t i = 0; prefer && i < dim_iters_->count(); ++i) {
+    int64_t token_doc_cnt = 0;
+    const ObTextRetrievalBlockMaxIter *block_max_iter = static_cast<ObTextRetrievalBlockMaxIter *>(dim_iters_->at(i));
+    if (OB_SUCCESS != block_max_iter->get_token_doc_cnt(token_doc_cnt)) {
+      prefer = false;  // estimation not available, keep block max pruning
+    } else {
+      total_doc_cnt += token_doc_cnt;
+      prefer = total_doc_cnt <= EXHAUSTIVE_SEARCH_MAX_DOC_CNT;
+    }
+  }
+  return prefer;
+}
+
 } // namespace storage
 } // namespace oceanbase

@@ -129,7 +129,8 @@ protected:
   virtual bool support_linear_merge() const { return false; }
   bool can_use_linear_merge() const;
   void reset_linear_merge_state();
-  int linear_merge_round(int64_t &count);
+  // collect_only: hand the row to process_collected_row() but do not filter / cache it for output
+  int linear_merge_round(int64_t &count, const bool collect_only = false);
   static const int64_t LINEAR_MERGE_MAX_DIM_CNT = 8;
 protected:
   ObIAllocator *iter_allocator_;

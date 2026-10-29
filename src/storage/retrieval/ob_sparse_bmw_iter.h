@@ -42,8 +42,14 @@ public:
 protected:
   virtual int process_collected_row(const ObDatum &id_datum, const double relevance) override;
   virtual int init_before_wand_process() { return OB_SUCCESS; }
+  // Called once the top k heap is full. Returning true scores every remaining document
+  // through the same heap instead of pruning by block max: on short posting lists the
+  // pivot / range bookkeeping costs more than it skips. The heap keeps the same rows
+  // either way, since block max only skips documents that could not enter it.
+  virtual bool prefer_exhaustive_search() { return false; }
 
   int top_k_search();
+  int exhaustive_top_k_search();
   int build_top_k_heap();
   int next_pivot(int64_t &pivot_iter_idx);
   int next_pivot_range(int64_t &skip_range_cnt);

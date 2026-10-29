@@ -85,7 +85,10 @@ public:
 protected:
   virtual int get_next_rows(const int64_t capacity, int64_t &count) override;
   virtual int init_before_wand_process() override;
+  virtual bool prefer_exhaustive_search() override;
 protected:
+  // total postings of all query tokens up to which every document is scored directly
+  static const int64_t EXHAUSTIVE_SEARCH_MAX_DOC_CNT = 64L * 1024L;
   ObBM25ParamEstimator bm25_param_estimator_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObTextBMWIter);

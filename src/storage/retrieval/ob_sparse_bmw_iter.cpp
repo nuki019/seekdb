@@ -117,6 +117,12 @@ int ObSRBMWIterImpl::top_k_search()
     } else {
       status_ = BMWStatus::FINISHED;
     }
+  } else if (prefer_exhaustive_search()) {
+    if (OB_FAIL(exhaustive_top_k_search())) {
+      if (OB_ITER_END == ret) {
+        status_ = BMWStatus::FINISHED;
+      }
+    }
   } else if (OB_FAIL(init_before_wand_process())) {
   } else {
     status_ = BMWStatus::FIND_NEXT_PIVOT;
@@ -208,6 +214,49 @@ int ObSRBMWIterImpl::build_top_k_heap()
     }
 
     if (FAILEDx(fill_merge_heap())) {
+    }
+  }
+  return ret;
+}
+
+int ObSRBMWIterImpl::exhaustive_top_k_search()
+{
+  int ret = OB_SUCCESS;
+  // the merge heap was refilled by build_top_k_heap(); process_collected_row() keeps the top k
+  if (merge_cmp_.has_fast_cmp() && dim_iters_->count() <= LINEAR_MERGE_MAX_DIM_CNT) {
+    // few dims: move their current positions out of the heap and continue with the heap-free merge
+    const int64_t dim_cnt = dim_iters_->count();
+    reset_linear_merge_state();
+    for (int64_t i = 0; i < dim_cnt; ++i) {
+      lm_exhausted_[i] = true;
+    }
+    while (OB_SUCC(ret) && !merge_heap_->empty()) {
+      const ObSRMergeItem *top_item = nullptr;
+      if (OB_FAIL(merge_heap_->top(top_item))) {
+      } else {
+        lm_exhausted_[top_item->iter_idx_] = false;
+        lm_scores_[top_item->iter_idx_] = top_item->relevance_;
+        ret = merge_heap_->pop();
+      }
+    }
+    next_round_cnt_ = 0;
+    int64_t unused_count = 0;
+    while (OB_SUCC(ret)) {
+      if (OB_FAIL(linear_merge_round(unused_count, true /* collect_only */))) {
+        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        }
+      }
+    }
+  } else {
+    bool need_project = true;
+    double relevance = 0.0;
+    const ObDatum *id_datum = nullptr;
+    while (OB_SUCC(ret)) {
+      if (OB_FAIL(collect_dims_by_id(id_datum, relevance, need_project))) {
+      } else if (OB_FAIL(fill_merge_heap())) {
+        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        }
+      }
     }
   }
   return ret;

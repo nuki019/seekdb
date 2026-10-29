@@ -294,7 +294,7 @@ void ObSRDaaTIterImpl::reset_linear_merge_state()
 // Heap-free equivalent of fill_merge_heap() + collect_dims_by_id() for a few dimensions:
 // advance the dims consumed by the previous round, pick the smallest current id by a linear
 // scan, and collect every dim positioned on it (in ascending dim order).
-int ObSRDaaTIterImpl::linear_merge_round(int64_t &count)
+int ObSRDaaTIterImpl::linear_merge_round(int64_t &count, const bool collect_only)
 {
   int ret = OB_SUCCESS;
   const int64_t dim_cnt = dim_iters_->count();
@@ -351,6 +351,7 @@ int ObSRDaaTIterImpl::linear_merge_round(int64_t &count)
       if (OB_FAIL(ret)) {
       } else if (OB_FAIL(relevance_collector_->get_result(relevance, need_project))) {
       } else if (need_project && OB_FAIL(process_collected_row(*id_datum, relevance))) {
+      } else if (collect_only) {
       } else if (need_project && OB_FAIL(filter_on_demand(count, relevance, need_project))) {
       } else if (need_project && OB_FAIL(cache_result(count, *id_datum, relevance))) {
         if (OB_ITER_END != ret) {

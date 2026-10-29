@@ -185,6 +185,8 @@ public:
   virtual bool in_shallow_status() const override;
   // currently, for text retrieval, total_doc_cnt and token_doc_cnt is required before block max calculation
   int init_block_max_iter(const int64_t total_doc_cnt, const double avg_doc_token_cnt);
+  // valid once the first row has been fetched
+  int get_token_doc_cnt(int64_t &token_doc_cnt) const { return token_iter_.get_token_doc_cnt(token_doc_cnt); }
 private:
   int calc_dim_max_score(
       const ObBlockMaxScoreIterParam &block_max_iter_param,
