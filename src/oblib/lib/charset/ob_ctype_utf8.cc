@@ -421,6 +421,12 @@ static int ob_strnncollsp_utf8mb4(const ObCharsetInfo *cs,
       continue;
     }
     int s_res= ob_mb_wc_utf8mb4(cs, &src_wc, src, se);
+    if (s_res > 0 && *src == *dst && te - dst >= s_res && 0 == memcmp(src, dst, s_res)) {
+      // the same valid character on both sides has the same weight; skip it without decoding dst
+      src += s_res;
+      dst += s_res;
+      continue;
+    }
     int t_res= ob_mb_wc_utf8mb4(cs, &dst_wc, dst, te);
     if ( s_res <= 0 || t_res <= 0 ) {
       return bincmp_utf8mb4(src, se, dst, te);
