@@ -381,6 +381,10 @@ struct ObDatumStrCmpImpl
       const uint32_t len = l.len_ < r.len_ ? l.len_ : r.len_;
       const int c = len > 0 ? MEMCMP(l.ptr_, r.ptr_, len) : 0;
       cmp_ret = 0 != c ? (c > 0 ? 1 : -1) : (l.len_ > r.len_ ? 1 : (l.len_ < r.len_ ? -1 : 0));
+    } else if (l.len_ == r.len_ && (l.ptr_ == r.ptr_ || (nullptr != l.ptr_ && nullptr != r.ptr_
+                                                          && 0 == MEMCMP(l.ptr_, r.ptr_, l.len_)))) {
+      // byte-identical strings collate equal under every collation; skip the charset dispatch
+      cmp_ret = 0;
     } else {
       cmp_ret = ObCharset::strcmpsp(cs, l.ptr_, l.len_, r.ptr_, r.len_, with_end_space);
       cmp_ret = cmp_ret > 0 ? 1 : (cmp_ret < 0 ? -1 : 0);

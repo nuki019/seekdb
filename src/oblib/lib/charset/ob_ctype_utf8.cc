@@ -400,6 +400,10 @@ static int ob_strnncollsp_utf8mb4(const ObCharsetInfo *cs,
                        bool diff_if_only_endspace_difference)
 {
   int res;
+  if (srclen == dstlen && (src == dst || 0 == memcmp(src, dst, srclen))) {
+    // byte-identical strings (valid or not) always collate equal; common when sorting index keys
+    return 0;
+  }
   ob_wc_t src_wc = 0, dst_wc = 0;
   const unsigned char *se= src + srclen, *te= dst + dstlen;
   ObUnicaseInfo *uni_plane= cs->caseinfo;
