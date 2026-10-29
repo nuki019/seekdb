@@ -227,7 +227,10 @@ int oceanbase::storage::ObDDLStorageUtil::report_ddl_sstable_checksum(
         break;
       }
     }
-    ob_usleep(100L * 1000L);
+    // the checksum rows are committed synchronously through sql_proxy, so only back off on failure
+    if (OB_FAIL(ret)) {
+      ob_usleep(100L * 1000L);
+    }
   }
   return ret;
 }
