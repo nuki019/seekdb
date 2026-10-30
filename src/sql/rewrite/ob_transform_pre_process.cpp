@@ -177,9 +177,26 @@ int ObTransformPreProcess::transform_one_stmt(common::ObIArray<ObParentDMLStmt> 
         trans_happened |= is_happened;
       }
     }
-    if (OB_SUCC(ret)) {
-      if (stmt->get_match_exprs().count() > 0 &&
-          OB_FAIL(preserve_order_for_fulltext_search(stmt, is_happened))) {
+    if (OB_SUCC(ret) && stmt->get_match_exprs().count() > 0) {
+      // the relevance order only matters when the rows of this stmt can be observed
+      bool is_unobserved = false;
+      if (OB_FAIL(check_view_rows_unobserved(parent_stmts, stmt, is_unobserved))) {
+      } else if (is_unobserved) {
+        // neither the order nor the values of the rows are needed, so the text retrieval scan
+        // does not have to look up the base table for the selected columns either
+        ObSelectStmt *sel_stmt = static_cast<ObSelectStmt*>(stmt);
+        for (int64_t i = 0; OB_SUCC(ret) && i < sel_stmt->get_select_item_size(); ++i) {
+          SelectItem &item = sel_stmt->get_select_item(i);
+          ObConstRawExpr *one_expr = NULL;
+          if (!item.expr_->is_column_ref_expr()) {
+          } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(*ctx_->expr_factory_, ObIntType, 1, one_expr))) {
+          } else {
+            item.expr_ = one_expr;
+            trans_happened = true;
+          }
+        }
+        OPT_TRACE("skip fulltext relevance order, view rows are only counted");
+      } else if (OB_FAIL(preserve_order_for_fulltext_search(stmt, is_happened))) {
       } else {
         trans_happened |= is_happened;
       }
@@ -3946,7 +3963,54 @@ int ObTransformPreProcess::preserve_order_for_fulltext_search(ObDMLStmt *stmt, b
   return ret;
 }
 
-int ObTransformPreProcess::preserve_order_for_pagination(ObDMLStmt *stmt, 
+// The view's rows are unobserved when its direct parent reads no column of it, e.g.
+// SELECT COUNT(*) FROM (SELECT id FROM t WHERE MATCH(c) AGAINST('x') LIMIT 20) v.
+// Then only the number of rows matters, which does not depend on their order.
+int ObTransformPreProcess::check_view_rows_unobserved(const ObIArray<ObParentDMLStmt> &parent_stmts,
+                                                      const ObDMLStmt *stmt,
+                                                      bool &is_unobserved)
+{
+  int ret = OB_SUCCESS;
+  is_unobserved = false;
+  const ObDMLStmt *parent = NULL;
+  const TableItem *view = NULL;
+  if (OB_ISNULL(stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (parent_stmts.empty() || !stmt->is_select_stmt()) {
+    // do nothing
+  } else if (OB_ISNULL(parent = parent_stmts.at(parent_stmts.count() - 1).stmt_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (!parent->is_select_stmt()
+             || static_cast<const ObSelectStmt*>(parent)->is_set_stmt()
+             || parent->get_table_size() != 1
+             || parent->get_column_size() != 0
+             || parent->get_subquery_expr_size() != 0
+             || !parent->get_semi_infos().empty()
+             || !parent->get_joined_tables().empty()) {
+    // do nothing
+  } else if (OB_ISNULL(view = parent->get_table_item(0))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (!view->is_generated_table() || view->ref_query_ != stmt) {
+    // do nothing
+  } else {
+    // the select items may only be replaced when they do not decide the rows of the view
+    const ObSelectStmt *sel_stmt = static_cast<const ObSelectStmt*>(stmt);
+    is_unobserved = !sel_stmt->is_set_stmt()
+                    && !sel_stmt->has_distinct()
+                    && !sel_stmt->has_group_by()
+                    && !sel_stmt->has_order_by()
+                    && !sel_stmt->has_window_function()
+                    && 0 == sel_stmt->get_aggr_item_size()
+                    && 1 == sel_stmt->get_table_size();
+    for (int64_t i = 0; is_unobserved && i < sel_stmt->get_select_item_size(); ++i) {
+      const ObRawExpr *expr = sel_stmt->get_select_item(i).expr_;
+      is_unobserved = NULL != expr && (expr->is_column_ref_expr() || expr->is_const_raw_expr());
+    }
+  }
+  return ret;
+}
+
+int ObTransformPreProcess::preserve_order_for_pagination(ObDMLStmt *stmt,
                                                          bool &trans_happened)
 {
   int ret = OB_SUCCESS;

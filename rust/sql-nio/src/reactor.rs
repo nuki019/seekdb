@@ -217,8 +217,14 @@ pub(crate) struct EventLoop {
 
 impl EventLoop {
     pub(crate) fn run(mut self) {
+        // A client usually sends its next statement right after reading the previous
+        // response, so for a short while after the last event the reactor polls without
+        // blocking. This skips the sleep/wake round trip in epoll for back-to-back
+        // statements, like the request workers do before parking.
+        const SPIN_AFTER_EVENT: Duration = Duration::from_micros(100);
         let mut events = Events::with_capacity(512);
         let mut stopping = false;
+        let mut last_event: Option<Instant> = None;
         loop {
             if !stopping && self.stop.load(Ordering::Acquire) {
                 self.begin_shutdown();
@@ -235,18 +241,25 @@ impl EventLoop {
             if let Some(startup) = self.pipe_startup.take() {
                 let _ = startup.send(self.pending_pipe.is_some());
             }
-            self.reactor_polling.store(true, Ordering::Release);
+            let spinning = !stopping
+                && last_event.map_or(false, |t| t.elapsed() < SPIN_AFTER_EVENT);
+            // a spinning reactor comes back to the queues by itself, so nobody needs to wake it
+            self.reactor_polling.store(!spinning, Ordering::Release);
             let skip_poll = !stopping
                 && (!self.ready.lock().unwrap().is_empty()
                     || !self.commits.lock().unwrap().is_empty());
             let poll_failed = if skip_poll {
                 false
             } else {
-                self.poll
-                    .poll(&mut events, Some(Duration::from_millis(1000)))
-                    .is_err()
+                let timeout = if spinning { Duration::ZERO } else { Duration::from_millis(1000) };
+                self.poll.poll(&mut events, Some(timeout)).is_err()
             };
             self.reactor_polling.store(false, Ordering::Release);
+            if skip_poll || (!poll_failed && !events.is_empty()) {
+                last_event = Some(Instant::now());
+            } else if spinning {
+                std::hint::spin_loop();
+            }
             if !stopping {
                 self.refresh_tcp_keepalive();
             }

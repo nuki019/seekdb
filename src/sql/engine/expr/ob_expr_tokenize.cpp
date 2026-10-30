@@ -48,17 +48,41 @@ public:
   ObExprTokenizeCtx()
     : ObExprOperatorCtx(),
       helper_(),
-      parser_name_len_(0)
+      parser_name_len_(0),
+      word_map_(),
+      word_map_bkt_cnt_(0)
   {
     parser_name_buf_[0] = '\0';
   }
   virtual ~ObExprTokenizeCtx() override
   {
+    word_map_.destroy();
     helper_.reset();
+  }
+  // The tokens are printed in the iteration order of the word map, which depends on its
+  // bucket count, so the map is sized exactly like a fresh one and reused only for that size.
+  int get_word_map(const int64_t bucket_cnt, storage::ObFTWordMap *&word_map)
+  {
+    int ret = OB_SUCCESS;
+    if (word_map_.created() && word_map_bkt_cnt_ == bucket_cnt) {
+      word_map_.reuse();
+    } else {
+      word_map_.destroy();
+      word_map_bkt_cnt_ = 0;
+      if (OB_SUCC(word_map_.create(bucket_cnt, common::ObMemAttr("FTWordMap")))) {
+        word_map_bkt_cnt_ = bucket_cnt;
+      }
+    }
+    if (OB_SUCC(ret)) {
+      word_map = &word_map_;
+    }
+    return ret;
   }
   storage::ObFTParseHelper helper_;
   char parser_name_buf_[storage::OB_FT_PARSER_NAME_LENGTH];
   int64_t parser_name_len_;
+  storage::ObFTWordMap word_map_;
+  int64_t word_map_bkt_cnt_;
 };
 } // namespace
 
@@ -89,8 +113,9 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
   } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
   } else {
     storage::ObFTParseHelper *helper_ptr = nullptr;
+    ObExprTokenizeCtx *tok_ctx = nullptr;
     if (expr.arg_cnt_ < 3 && expr.expr_ctx_id_ != ObExpr::INVALID_EXP_CTX_ID) {
-      ObExprTokenizeCtx *tok_ctx = static_cast<ObExprTokenizeCtx *>(
+      tok_ctx = static_cast<ObExprTokenizeCtx *>(
           ctx.exec_ctx_.get_expr_op_ctx(expr.expr_ctx_id_));
       if (OB_ISNULL(tok_ctx)) {
         if (OB_FAIL(ctx.exec_ctx_.create_expr_op_ctx(expr.expr_ctx_id_, tok_ctx))) {
@@ -116,10 +141,10 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
       }
     }
     if (OB_NOT_NULL(helper_ptr)) {
-      const int64_t ft_word_bkt_cnt = MIN(MAX(param.fulltext_.length() / 2, 2), 67);
+      const int64_t ft_word_bkt_cnt = MIN(MAX(param.fulltext_.length() / 2, 2), 997);
       int64_t doc_len = 0;
       storage::ObFTWordMap *token_map = nullptr;
-      if (OB_FAIL(helper_ptr->get_word_map(ft_word_bkt_cnt, token_map))) {
+      if (OB_FAIL(tok_ctx->get_word_map(ft_word_bkt_cnt, token_map))) {
       } else if ((0 != param.fulltext_.length()) &&
                  OB_FAIL(helper_ptr->segment(param.meta_,
                                              param.fulltext_.ptr(),
@@ -152,12 +177,13 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
   storage::ObFTParseHelper tokenize_helper;
   const int64_t ft_word_bkt_cnt = MIN(MAX(param.fulltext_.length() / 2, 2), 997);
   int64_t doc_len = 0;
-  storage::ObFTWordMap *token_map = nullptr;
+  storage::ObFTWordMap word_map;
+  storage::ObFTWordMap *token_map = &word_map;
 
   if (TokenizeParam::OUTPUT_MODE::DEFAULT != mode && TokenizeParam::OUTPUT_MODE::ALL != mode) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(tokenize_helper.init(&allocator, param.parser_name_, param.properties_))) {
-  } else if (OB_FAIL(tokenize_helper.get_word_map(ft_word_bkt_cnt, token_map))) {
+  } else if (OB_FAIL(word_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
   } else if (
       (0 != param.fulltext_.length())
       && OB_FAIL(tokenize_helper.segment(
