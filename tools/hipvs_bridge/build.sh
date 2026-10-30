@@ -54,7 +54,9 @@ GPU_ARCH=${GPU_ARCH:-gfx1100}
   -L"$HIPVS_ROOT/lib" \
   -Wl,-soname,libseekdb_cuvs_bridge.so \
   -Wl,-rpath,"$HIPVS_ROOT/lib:$ROCM_ROOT/lib" \
+  -L"$ROCM_ROOT/lib" \
   -lcuvs_c \
+  -lrocblas \
   -o "$OUTPUT"
 
 echo "built $OUTPUT"
