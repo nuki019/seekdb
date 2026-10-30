@@ -1193,8 +1193,10 @@ int ObDDLUtil::get_temp_store_compress_type(const ObCompressorType schema_compr_
     } else if (0 == config_text.case_compare("ZSTD")) {
       compr_type = ZSTD_1_3_8_COMPRESSOR;
     } else if (0 == config_text.case_compare("AUTO")) {
-      UNUSED(parallel);
-      if (schema_compr_type > INVALID_COMPRESSOR && schema_compr_type < MAX_COMPRESSOR) {
+      // a serial build spills little: compressing it only costs cpu on the single sort thread
+      if (parallel <= 1) {
+        compr_type = NONE_COMPRESSOR;
+      } else if (schema_compr_type > INVALID_COMPRESSOR && schema_compr_type < MAX_COMPRESSOR) {
         compr_type = schema_compr_type;
       } else {
         compr_type = NONE_COMPRESSOR;

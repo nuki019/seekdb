@@ -74,6 +74,19 @@ private:
       const int64_t lv = l.get_int();
       const int64_t rv = r.get_int();
       res = lv < rv ? -1 : (lv > rv ? 1 : 0);
+    } else if (16 == l.len_ && 16 == r.len_) {
+      // docid (tablet id, seq): two big-endian words give the same order as memcmp
+      uint64_t lw[2];
+      uint64_t rw[2];
+      MEMCPY(lw, l.ptr_, sizeof(lw));
+      MEMCPY(rw, r.ptr_, sizeof(rw));
+      uint64_t lv = __builtin_bswap64(lw[0]);
+      uint64_t rv = __builtin_bswap64(rw[0]);
+      if (lv == rv) {
+        lv = __builtin_bswap64(lw[1]);
+        rv = __builtin_bswap64(rw[1]);
+      }
+      res = lv < rv ? -1 : (lv > rv ? 1 : 0);
     } else {
       const uint32_t ll = l.len_;
       const uint32_t rl = r.len_;

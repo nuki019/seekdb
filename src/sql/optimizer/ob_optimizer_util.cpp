@@ -6952,6 +6952,16 @@ int ObOptimizerUtil::check_can_encode_sortkey(const common::ObIArray<OrderItem> 
   } else if (has_hint) {
     if (OB_FAIL(opt_params.get_bool_opt_param(ObOptParamHint::ENABLE_NEWSORT, can_sort_opt))) {
     }
+    // the hint skips the size policy, but every key must still be encodable; varchar is
+    // encoded like char (pad space aware), sort falls back to plain compare on invalid unicode
+    for (int64_t i = 0; OB_SUCC(ret) && can_sort_opt && i < order_keys.count(); i++) {
+      const ObObjType type = order_keys.at(i).expr_->get_data_type();
+      if (!ObOrderPerservingEncoder::can_encode_sortkey(
+                            ObVarcharType == type ? ObCharType : type,
+                            order_keys.at(i).expr_->get_collation_type())) {
+        can_sort_opt = false;
+      }
+    }
   } else {
     can_sort_opt &= config::_enable_newsort();
 
