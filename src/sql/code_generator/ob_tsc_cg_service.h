@@ -208,7 +208,11 @@ private:
                                            const ObLogTableScan &op,
                                            ObDASScanCtDef &scan_ctdef);
   int generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_info,
+                                  const bool need_calc_relevance,
                                   ObDASIRScanCtDef &text_ir_scan_ctdef);
+  bool is_relevance_unobserved(const ObLogTableScan &op,
+                               const DASScanCGCtx &cg_ctx,
+                               const ObTextRetrievalInfo &tr_info) const;
   int check_skip_index_validity(const ObTextRetrievalInfo &tr_info, bool &is_valid) const;
   int generate_text_block_max_scan_ctdef(const ObTextRetrievalInfo &tr_info,
                                          ObDASIRScanCtDef &text_ir_scan_ctdef);

@@ -1809,6 +1809,7 @@ int ObTscCgService::generate_text_ir_ctdef(const ObLogTableScan &op,
   ObDASScanCtDef *inv_idx_scan_ctdef = nullptr;
   ObExpr *index_back_doc_id_column = nullptr;
   bool has_rowscn = false;
+  const bool need_calc_relevance = tr_info.need_calc_relevance_ && !is_relevance_unobserved(op, cg_ctx, tr_info);
   if (OB_ISNULL(match_against) || OB_ISNULL(schema_guard)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_UNLIKELY(OB_INVALID_ID == tr_info.inv_idx_tid_)) {
@@ -1829,7 +1830,7 @@ int ObTscCgService::generate_text_ir_ctdef(const ObLogTableScan &op,
   }
 
   if (OB_FAIL(ret)) {
-  } else if (tr_info.need_calc_relevance_) {
+  } else if (need_calc_relevance) {
     ObDASScanCtDef *inv_idx_agg_ctdef = nullptr;
     ObDASScanCtDef *doc_agg_ctdef = nullptr;
     ObDASScanCtDef *block_max_scan_ctdef = nullptr;
@@ -1894,7 +1895,7 @@ int ObTscCgService::generate_text_ir_ctdef(const ObLogTableScan &op,
 
   if (OB_SUCC(ret)) {
     root_ctdef = ir_scan_ctdef;
-    if (OB_FAIL(generate_text_ir_spec_exprs(tr_info, *ir_scan_ctdef))) {
+    if (OB_FAIL(generate_text_ir_spec_exprs(tr_info, need_calc_relevance, *ir_scan_ctdef))) {
     } else {
       const ObCostTableScanInfo *est_cost_info = op.get_est_cost_info();
       int partition_row_cnt = 0;
@@ -2994,7 +2995,44 @@ int ObTscCgService::generate_spiv_block_max_spec(
   return ret;
 }
 
+static bool raw_expr_contains(const ObRawExpr *expr, const ObRawExpr *target)
+{
+  bool found = (expr == target);
+  for (int64_t i = 0; !found && NULL != expr && i < expr->get_param_count(); ++i) {
+    found = raw_expr_contains(expr->get_param_expr(i), target);
+  }
+  return found;
+}
+
+// A natural language MATCH whose score leaves the scan only through the pushed down filter
+// bool(MATCH(...)) needs no bm25 at all: bm25 is positive for every document holding a query
+// token (idf is floored at epsilon > 0 and the term frequency is at least 1), so the filter
+// keeps exactly the documents of the posting list union, e.g. SELECT COUNT(*) ... WHERE MATCH.
+bool ObTscCgService::is_relevance_unobserved(const ObLogTableScan &op,
+                                             const DASScanCGCtx &cg_ctx,
+                                             const ObTextRetrievalInfo &tr_info) const
+{
+  const ObRawExpr *match_expr = tr_info.match_expr_;
+  const ObRawExpr *filter = tr_info.pushdown_match_filter_;
+  bool unobserved = !(cg_ctx.is_func_lookup_ || cg_ctx.is_es_match_ || cg_ctx.is_merge_fts_index_
+                      || cg_ctx.is_vec_iter_func_lookup_)
+                    && NULL != match_expr && NULL != filter
+                    && NATURAL_LANGUAGE_MODE == tr_info.match_expr_->get_mode_flag()
+                    && !tr_info.need_sort() && NULL == tr_info.topk_limit_expr_
+                    && T_OP_BOOL == filter->get_expr_type() && 1 == filter->get_param_count()
+                    && filter->get_param_expr(0) == match_expr
+                    && tr_info.match_expr_->get_columns_boosts().count() == 0;
+  for (int64_t i = 0; unobserved && i < op.get_filter_exprs().count(); ++i) {
+    unobserved = op.get_filter_exprs().at(i) == filter;
+  }
+  for (int64_t i = 0; unobserved && i < op.get_output_exprs().count(); ++i) {
+    unobserved = !raw_expr_contains(op.get_output_exprs().at(i), match_expr);
+  }
+  return unobserved;
+}
+
 int ObTscCgService::generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_info,
+                                                const bool need_calc_relevance,
                                                 ObDASIRScanCtDef &text_ir_scan_ctdef)
 {
   int ret = OB_SUCCESS;
@@ -3045,7 +3083,7 @@ int ObTscCgService::generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_in
     }
   }
 
-  if (OB_SUCC(ret) && tr_info.need_calc_relevance_) {
+  if (OB_SUCC(ret) && need_calc_relevance) {
     if (OB_ISNULL(tr_info.relevance_expr_)) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(cg_.generate_rt_expr(*tr_info.relevance_expr_, text_ir_scan_ctdef.relevance_expr_))) {
@@ -3057,7 +3095,7 @@ int ObTscCgService::generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_in
     }
   }
 
-  if (OB_SUCC(ret) && (tr_info.need_calc_relevance_ || nullptr != tr_info.pushdown_match_filter_)) {
+  if (OB_SUCC(ret) && (need_calc_relevance || nullptr != tr_info.pushdown_match_filter_)) {
     if (OB_FAIL(cg_.generate_rt_expr(*tr_info.match_expr_,
                                             text_ir_scan_ctdef.relevance_proj_col_))) {
     } else if (OB_ISNULL(text_ir_scan_ctdef.relevance_proj_col_)) {
